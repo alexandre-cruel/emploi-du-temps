@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+.venv/
+*.xlsx
+!TERMINALES-rentrée2026.xlsx
+.DS_Store
