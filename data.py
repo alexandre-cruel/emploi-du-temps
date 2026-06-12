@@ -31,8 +31,11 @@ SLOT_MATCO = 4    # Mercredi 8h10 — Maths complémentaires
 
 N_SLOTS = len(SLOTS)
 
-# Jours à double créneau (pour calcul des permanences)
+# Paires de créneaux sur le même jour (pour permanences — matin uniquement)
 DOUBLE_SLOT_PAIRS: list[tuple[int, int]] = [(2, 3), (5, 6), (7, 8)]
+
+# Toutes les paires du même jour (y compris lundi apr-midi) — pour contrainte "1 créneau/jour max"
+SAME_DAY_PAIRS: list[tuple[int, int]] = [(0, 1), (2, 3), (5, 6), (7, 8)]
 
 # Mapping normalisation des noms de spécialités (tels qu'ils apparaissent dans le fichier)
 _SPE_ALIASES: dict[str, str] = {

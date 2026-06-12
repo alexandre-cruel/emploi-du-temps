@@ -3,16 +3,18 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import pytest
-from data import Student, ParseResult, SLOTS
+from data import Student, ParseResult, SLOTS, SAME_DAY_PAIRS, SPE_4_SLOTS
 from solver import (
     SolverConfig,
     GroupResult,
     solve,
     build_default_config,
     default_slot_availability,
+    split_lab_groups,
     _count_conflicts,
     SLOT_MATCO,
     SLOT_MATEX,
+    N_SLOTS,
 )
 
 XLSX_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "TERMINALES-rentrée2026.xlsx")
@@ -43,24 +45,28 @@ def _make_parse_result(students: list[Student]) -> ParseResult:
 
 
 # ---------------------------------------------------------------------------
-# Tests slot availability defaults
+# Tests slot availability defaults — tous True après correctif 1
 # ---------------------------------------------------------------------------
 
-def test_maths_avail_blocks_matex():
+def test_default_avail_all_true_maths():
     avail = default_slot_availability("Maths")
-    assert avail[SLOT_MATEX] is False
-    assert avail[SLOT_MATCO] is True  # Maths peut utiliser Cr4
+    assert all(avail), "Maths : tous les créneaux doivent être disponibles par défaut"
 
 
-def test_spc_avail_blocks_matco():
+def test_default_avail_all_true_spc():
     avail = default_slot_availability("SPC")
-    assert avail[SLOT_MATCO] is False
-    assert avail[SLOT_MATEX] is True  # SPC peut utiliser Cr1
+    assert all(avail), "SPC : tous les créneaux doivent être disponibles par défaut"
 
 
-def test_svt_avail_blocks_matco():
+def test_default_avail_all_true_svt():
     avail = default_slot_availability("SVT")
-    assert avail[SLOT_MATCO] is False
+    assert all(avail), "SVT : tous les créneaux doivent être disponibles par défaut"
+
+
+def test_default_avail_length():
+    for spe in ("Maths", "SPC", "SVT", "SES", "HLP", "LCE", "NSI", "HGGSP"):
+        avail = default_slot_availability(spe)
+        assert len(avail) == N_SLOTS
 
 
 # ---------------------------------------------------------------------------
@@ -166,21 +172,107 @@ def test_real_data_maths_common_slot():
         assert len(common) >= 1, "Les groupes Maths n'ont aucun créneau commun"
 
 
-def test_spc_svt_matco_free():
-    """Les élèves SPC-SVT doivent avoir Cr4 (matco) libre."""
+# ---------------------------------------------------------------------------
+# Test correctif 2 — contrainte "pas 2 créneaux le même jour"
+# ---------------------------------------------------------------------------
+
+def test_no_double_slot_same_day():
+    """Aucun groupe (sauf HLP) ne doit avoir les deux créneaux d'un même jour.
+    HLP est une exception : ses 3 créneaux {Cr0, Cr5, Cr6} incluent intentionnellement
+    Cr5+Cr6 le jeudi (2 enseignants — philo + littérature)."""
     from data import parse_xlsx
     pr = parse_xlsx(XLSX_PATH)
     config = build_default_config(pr)
     result = solve(pr, config)
-    spc_slots: dict[int, list[int]] = {}
-    svt_slots: dict[int, list[int]] = {}
     for g in result.groups:
-        if g.specialite == "SPC":
-            spc_slots[g.groupe_id] = g.slots
-        elif g.specialite == "SVT":
-            svt_slots[g.groupe_id] = g.slots
-    # Vérifier qu'aucun groupe SPC ou SVT n'utilise Cr4
-    for gid, slots in spc_slots.items():
-        assert SLOT_MATCO not in slots, f"SPC groupe {gid} utilise Cr4 (matco)"
-    for gid, slots in svt_slots.items():
-        assert SLOT_MATCO not in slots, f"SVT groupe {gid} utilise Cr4 (matco)"
+        if g.specialite == "HLP":
+            continue
+        for c_a, c_b in SAME_DAY_PAIRS:
+            assert not (c_a in g.slots and c_b in g.slots), (
+                f"{g.label} utilise Cr{c_a} ET Cr{c_b} (même jour)"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Test correctif 3 — taille min garantie
+# ---------------------------------------------------------------------------
+
+def test_min_group_size():
+    """Chaque groupe doit avoir au moins floor(N/G) élèves."""
+    from data import parse_xlsx
+    pr = parse_xlsx(XLSX_PATH)
+    config = build_default_config(pr)
+    result = solve(pr, config)
+    spe_students: dict[str, int] = {}
+    spe_groups: dict[str, list[int]] = {}
+    for g in result.groups:
+        spe_groups.setdefault(g.specialite, []).append(g.effectif)
+        spe_students[g.specialite] = spe_students.get(g.specialite, 0) + g.effectif
+    for spe, effectifs in spe_groups.items():
+        G = len(effectifs)
+        if G < 2:
+            continue
+        min_size = spe_students[spe] // G
+        for e in effectifs:
+            assert e >= min_size, (
+                f"{spe} : groupe avec {e} élèves < min_size={min_size}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Test correctif 4 — sous-groupes SPC/SVT
+# ---------------------------------------------------------------------------
+
+def test_split_lab_groups_creates_subgroups():
+    """split_lab_groups() crée les sous-groupes A/B pour SPC et SVT."""
+    students_a = [
+        Student(nom=f"Z{i}", prenom="T", classe_origine="", specialites=["SPC", "SVT"],
+                options=[], niveau="Terminale")
+        for i in range(10)
+    ]
+    g = GroupResult(specialite="SPC", groupe_id=0, students=students_a, slots=[2, 3, 5, 6])
+    split_lab_groups([g])
+    assert g.subgroups is not None
+    assert "A" in g.subgroups and "B" in g.subgroups
+    total = len(g.subgroups["A"]) + len(g.subgroups["B"])
+    assert total == 10
+    # A >= B (ceil)
+    assert len(g.subgroups["A"]) >= len(g.subgroups["B"])
+
+
+def test_split_lab_groups_alphabetic():
+    """Le split est alphabétique par nom."""
+    students_a = [
+        Student(nom=name, prenom="T", classe_origine="", specialites=["SVT", "SES"],
+                options=[], niveau="Terminale")
+        for name in ["Martin", "Dupont", "Bernard", "Adam"]
+    ]
+    g = GroupResult(specialite="SVT", groupe_id=0, students=students_a, slots=[0, 2, 5, 7])
+    split_lab_groups([g])
+    assert g.subgroups["A"][0].nom == "Adam"   # 1er alphabétique
+    assert g.subgroups["B"][-1].nom == "Martin"  # dernier alphabétique
+
+
+def test_split_lab_groups_no_subgroups_for_others():
+    """Les spés non SPC/SVT ne doivent pas avoir de sous-groupes."""
+    students_a = [
+        Student(nom=f"E{i}", prenom="T", classe_origine="", specialites=["Maths", "SES"],
+                options=[], niveau="Terminale")
+        for i in range(5)
+    ]
+    g = GroupResult(specialite="Maths", groupe_id=0, students=students_a, slots=[2, 5, 7])
+    split_lab_groups([g])
+    assert g.subgroups is None
+
+
+def test_real_data_subgroups_created():
+    """Les groupes SPC/SVT ont des sous-groupes A/B après solve()."""
+    from data import parse_xlsx
+    pr = parse_xlsx(XLSX_PATH)
+    config = build_default_config(pr)
+    result = solve(pr, config)
+    for g in result.groups:
+        if g.specialite in SPE_4_SLOTS:
+            assert g.subgroups is not None, f"{g.label} n'a pas de sous-groupes"
+            assert len(g.subgroups.get("A", [])) > 0
+            assert len(g.subgroups.get("B", [])) > 0

@@ -15,7 +15,7 @@ import openpyxl
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-from data import SLOTS, ParseResult
+from data import SLOTS, SPE_4_SLOTS, ParseResult
 from solver import GroupResult, SolverResult
 
 # Couleurs par spécialité
@@ -70,14 +70,21 @@ def generate_xlsx(result: SolverResult, parse_result: ParseResult) -> BytesIO:
 def _sheet_planning_groupes(wb: openpyxl.Workbook, result: SolverResult) -> None:
     ws = wb.create_sheet("Planning groupes")
 
-    # Collecte tous les groupes triés par spécialité + id
     groups = sorted(result.groups, key=lambda g: (g.specialite, g.groupe_id))
 
-    # En-têtes colonnes : Jour | Créneau | Groupe1 | Groupe2 | ...
+    # Construit les colonnes : groupes normaux + sous-groupes A/B pour SPC/SVT
+    col_entries: list[tuple[str, str, list[int]]] = []  # (label, spe, slots)
+    for g in groups:
+        if g.specialite in SPE_4_SLOTS and g.subgroups:
+            for letter in ("A", "B"):
+                col_entries.append((f"{g.label}{letter}", g.specialite, g.slots))
+        else:
+            col_entries.append((g.label, g.specialite, g.slots))
+
     ws.column_dimensions["A"].width = 14
     ws.column_dimensions["B"].width = 18
 
-    headers = ["Jour", "Créneau"] + [g.label for g in groups]
+    headers = ["Jour", "Créneau"] + [label for label, _, _ in col_entries]
     for col, h in enumerate(headers, start=1):
         cell = ws.cell(row=1, column=col, value=h)
         cell.fill = HEADER_FILL
@@ -85,20 +92,18 @@ def _sheet_planning_groupes(wb: openpyxl.Workbook, result: SolverResult) -> None
         cell.alignment = _centered()
         ws.column_dimensions[get_column_letter(col)].width = 16
 
-    # Pour chaque créneau, une ligne
     for row_idx, (slot_idx, day, start, end) in enumerate(SLOTS, start=2):
         ws.cell(row=row_idx, column=1, value=f"{day}").alignment = _centered()
         ws.cell(row=row_idx, column=2, value=f"{start}–{end}").alignment = _centered()
 
-        for col_idx, g in enumerate(groups, start=3):
-            if slot_idx in g.slots:
-                color = SPE_COLORS.get(g.specialite, DEFAULT_COLOR)
-                cell = ws.cell(row=row_idx, column=col_idx, value=g.label)
+        for col_idx, (label, spe, slots) in enumerate(col_entries, start=3):
+            if slot_idx in slots:
+                color = SPE_COLORS.get(spe, DEFAULT_COLOR)
+                cell = ws.cell(row=row_idx, column=col_idx, value=label)
                 cell.fill = _fill(color)
                 cell.alignment = _centered()
                 cell.font = _bold()
 
-    # Freeze première ligne
     ws.freeze_panes = "A2"
 
 
@@ -114,7 +119,7 @@ def _sheet_planning_eleves(
     ws = wb.create_sheet("Planning par élève")
 
     slot_labels = [f"{day} {start}" for _, day, start, end in SLOTS]
-    headers = ["Nom", "Prénom", "Doublette", "Options"] + slot_labels + ["Nb créneaux"]
+    headers = ["Nom", "Prénom", "Doublette", "Options", "Sous-groupe"] + slot_labels + ["Nb créneaux"]
 
     for col, h in enumerate(headers, start=1):
         cell = ws.cell(row=1, column=col, value=h)
@@ -126,29 +131,37 @@ def _sheet_planning_eleves(
     ws.column_dimensions["B"].width = 16
     ws.column_dimensions["C"].width = 20
     ws.column_dimensions["D"].width = 28
-    for c in range(5, 5 + len(SLOTS) + 1):
+    ws.column_dimensions["E"].width = 14
+    for c in range(6, 6 + len(SLOTS) + 1):
         ws.column_dimensions[get_column_letter(c)].width = 14
 
     student_groups = result.get_student_groups()
     student_slots = result.get_student_slots()
 
-    # Construit un dict nom_prenom → Student depuis parse_result
+    # Map nom_prenom → sous-groupe letter (A ou B) pour SPC/SVT
+    student_subgroup: dict[str, str] = {}
+    for g in result.groups:
+        if g.specialite in SPE_4_SLOTS and g.subgroups:
+            for letter, members in g.subgroups.items():
+                for st_obj in members:
+                    student_subgroup[f"{st_obj.nom} {st_obj.prenom}"] = letter
+
     student_map = {f"{s.nom} {s.prenom}": s for s in parse_result.students}
 
     row_idx = 2
     for name in sorted(student_map.keys()):
-        st = student_map[name]
+        st_obj = student_map[name]
         grps = student_groups.get(name, [])
         slots = student_slots.get(name, [])
 
-        ws.cell(row=row_idx, column=1, value=st.nom)
-        ws.cell(row=row_idx, column=2, value=st.prenom)
-        ws.cell(row=row_idx, column=3, value=" – ".join(st.specialites))
-        ws.cell(row=row_idx, column=4, value=", ".join(st.options) if st.options else "")
+        ws.cell(row=row_idx, column=1, value=st_obj.nom)
+        ws.cell(row=row_idx, column=2, value=st_obj.prenom)
+        ws.cell(row=row_idx, column=3, value=" – ".join(st_obj.specialites))
+        ws.cell(row=row_idx, column=4, value=", ".join(st_obj.options) if st_obj.options else "")
+        ws.cell(row=row_idx, column=5, value=student_subgroup.get(name, ""))
 
         for slot_idx in slots:
-            col = 5 + slot_idx
-            # Trouver quelle spécialité est dans ce créneau pour cet élève
+            col = 6 + slot_idx
             spe_label = ""
             for g in grps:
                 if slot_idx in g.slots:
@@ -160,7 +173,7 @@ def _sheet_planning_eleves(
                 cell.fill = _fill(SPE_COLORS.get(spe, DEFAULT_COLOR))
             cell.alignment = _centered()
 
-        ws.cell(row=row_idx, column=5 + len(SLOTS), value=len(slots))
+        ws.cell(row=row_idx, column=6 + len(SLOTS), value=len(slots))
         row_idx += 1
 
     ws.freeze_panes = "A2"

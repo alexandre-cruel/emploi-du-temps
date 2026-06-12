@@ -17,6 +17,32 @@ import export as _export
 
 N_SLOTS = len(_data.SLOTS)
 
+
+def _compute_option_slots(
+    solver_result: _solver.SolverResult,
+    parse_result: _data.ParseResult,
+) -> dict[str, dict]:
+    """Calcule les créneaux libres communs pour chaque option post-résolution."""
+    student_busy = solver_result.get_student_slots()
+
+    option_to_students: dict[str, list[str]] = {}
+    for s in parse_result.students:
+        for opt in s.options:
+            option_to_students.setdefault(opt, []).append(f"{s.nom} {s.prenom}")
+
+    all_slots = set(range(N_SLOTS))
+    result: dict[str, dict] = {}
+    for opt, names in option_to_students.items():
+        free = all_slots.copy()
+        for name in names:
+            busy = set(student_busy.get(name, []))
+            free &= (all_slots - busy)
+        result[opt] = {
+            "nb_eleves": len(names),
+            "free_slots": sorted(free),
+        }
+    return result
+
 st.set_page_config(
     page_title="Emploi du temps lycée",
     page_icon="📅",
@@ -185,41 +211,39 @@ def step_config() -> None:
     st.subheader("2b. Créneaux disponibles par spécialité")
     st.caption(
         "Cochez les créneaux utilisables pour chaque spécialité. "
-        "Cr1 (Lundi 15h50) est réservé aux options Maths expertes/DGEMC. "
-        "Cr4 (Mercredi 8h10) est réservé à Maths complémentaires."
+        "Cr1 (Lundi 15h50) est traditionnellement réservé aux options Maths expertes/DGEMC. "
+        "Cr4 (Mercredi 8h10) est traditionnellement réservé à Maths complémentaires. "
+        "Décochez-les si une spécialité ne doit pas utiliser ces créneaux."
     )
 
-    slot_labels_short = [
+    col_labels = [
         f"Cr{c}: {_data.SLOTS[c][1][:2]} {_data.SLOTS[c][2]}"
         for c in range(N_SLOTS)
     ]
 
-    # Tableau de disponibilité
-    avail_tab_cols = st.columns([2] + [1] * N_SLOTS)
-    with avail_tab_cols[0]:
-        st.markdown("**Spécialité**")
-    for c, lbl in enumerate(slot_labels_short):
-        with avail_tab_cols[c + 1]:
-            st.markdown(f"<small>{lbl}</small>", unsafe_allow_html=True)
-
-    for spe in specialites:
-        row_cols = st.columns([2] + [1] * N_SLOTS)
-        with row_cols[0]:
-            st.markdown(f"**{spe}**")
-        default_avail = existing_config.slot_availability.get(
+    avail_data = {
+        spe: existing_config.slot_availability.get(
             spe, _solver.default_slot_availability(spe)
         )
-        avail_row: list[bool] = []
-        for c in range(N_SLOTS):
-            with row_cols[c + 1]:
-                val = st.checkbox(
-                    "",
-                    value=bool(default_avail[c]),
-                    key=f"avail_{spe}_{c}",
-                    label_visibility="collapsed",
-                )
-                avail_row.append(val)
-        slot_avail_input[spe] = avail_row
+        for spe in specialites
+    }
+    df_avail = pd.DataFrame(avail_data, index=col_labels).T
+    df_avail.index.name = "Spécialité"
+
+    col_config = {
+        col: st.column_config.CheckboxColumn(col, width="small")
+        for col in col_labels
+    }
+
+    edited = st.data_editor(
+        df_avail,
+        column_config=col_config,
+        use_container_width=True,
+        key="avail_editor",
+    )
+
+    for spe in specialites:
+        slot_avail_input[spe] = [bool(edited.loc[spe, col]) for col in col_labels]
 
     st.divider()
     st.subheader("2c. Contraintes spéciales")
@@ -365,6 +389,42 @@ def step_solve() -> None:
     df_eff = pd.DataFrame(eff_rows)
     st.dataframe(df_eff, use_container_width=True, hide_index=True)
 
+    # Compatibilité des options
+    option_data = _compute_option_slots(solver_result, result)
+    if option_data:
+        st.divider()
+        with st.expander("🎓 Compatibilité des options", expanded=False):
+            st.caption(
+                "Créneaux libres en commun pour tous les élèves de chaque option, "
+                "compte tenu des créneaux spécialités attribués."
+            )
+            OPTION_PREFERRED = {
+                "Maths expertes": _data.SLOT_MATEX,
+                "Maths complémentaires": _data.SLOT_MATCO,
+                "DGEMC": _data.SLOT_MATEX,
+            }
+            opt_rows = []
+            for opt, info in sorted(option_data.items()):
+                free = info["free_slots"]
+                labels = [
+                    f"Cr{c}: {_data.SLOTS[c][1]} {_data.SLOTS[c][2]}"
+                    for c in free
+                ]
+                preferred = OPTION_PREFERRED.get(opt)
+                if preferred is not None and preferred in free:
+                    status = "✅ créneau habituel libre"
+                elif free:
+                    status = "⚠️ créneau habituel occupé"
+                else:
+                    status = "❌ aucun créneau libre commun"
+                opt_rows.append({
+                    "Option": opt,
+                    "Nb élèves": info["nb_eleves"],
+                    "Créneaux libres communs": ", ".join(labels) if labels else "—",
+                    "Statut": status,
+                })
+            st.dataframe(pd.DataFrame(opt_rows), use_container_width=True, hide_index=True)
+
     st.divider()
     col_a, col_b, col_c = st.columns(3)
     with col_a:
@@ -412,6 +472,46 @@ def step_adjustments() -> None:
         "Sélectionnez un élève pour voir son planning et le déplacer dans un autre groupe. "
         "Les conflits potentiels sont détectés en temps réel."
     )
+
+    # --- Sous-groupes A/B pour SPC et SVT ---
+    spc_svt_groups = [g for g in solver_result.groups if g.specialite in _data.SPE_4_SLOTS and g.subgroups]
+    if spc_svt_groups:
+        with st.expander("🔬 Sous-groupes TP (SPC/SVT)", expanded=False):
+            st.caption(
+                "Les sous-groupes A et B alternent entre cours en groupe entier et TP en demi-groupe. "
+                "Modifiez les affectations ci-dessous si nécessaire."
+            )
+            # Clé de stockage dans session_state
+            if "subgroups_override" not in st.session_state:
+                st.session_state["subgroups_override"] = {}
+
+            for g in sorted(spc_svt_groups, key=lambda x: (x.specialite, x.groupe_id)):
+                st.markdown(f"**{g.label}**")
+                sg_key = g.label
+                sub = g.subgroups or {}
+                rows = []
+                for letter in ("A", "B"):
+                    for st_obj in sub.get(letter, []):
+                        rows.append({"Nom": st_obj.nom, "Prénom": st_obj.prenom, "Sous-groupe": letter})
+
+                # Remplace par les overrides existants si disponibles
+                override = st.session_state["subgroups_override"].get(sg_key)
+                if override is not None:
+                    rows = override
+
+                df_sg = pd.DataFrame(rows)
+                edited_sg = st.data_editor(
+                    df_sg,
+                    column_config={
+                        "Sous-groupe": st.column_config.SelectboxColumn(
+                            "Sous-groupe", options=["A", "B"], required=True
+                        )
+                    },
+                    use_container_width=True,
+                    hide_index=True,
+                    key=f"sg_editor_{sg_key}",
+                )
+                st.session_state["subgroups_override"][sg_key] = edited_sg.to_dict("records")
 
     # Sélection de l'élève
     all_names = sorted(student_map.keys())

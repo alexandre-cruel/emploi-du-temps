@@ -3,14 +3,10 @@ from __future__ import annotations
 """
 Solveur CP-SAT pour la construction de l'emploi du temps.
 
-Logique des créneaux réservés options :
-  Cr1 (Lundi 15h50) = matex + DGEMC → bloqué uniquement pour Maths
-    (matex nécessite Maths spé ; un groupe Maths sur Cr1 créerait un conflit
-     pour ses propres élèves voulant faire matex)
-  Cr4 (Mercredi 8h10) = matco → bloqué pour toutes les spés SAUF Maths
-    (matco est pour les élèves sans Maths spé ; les élèves Maths font matex sur Cr1)
-    Exception : SVT et SPC peuvent aussi utiliser Cr1 car aucun de leurs élèves
-    ne peut faire matex (pas de Maths spé).
+Les options (Maths expertes/Cr1, Matco/Cr4, DGEMC/Cr1) sont planifiées
+APRÈS la résolution des spécialités — le solveur ne bloque aucun créneau
+pour les options. L'utilisateur contrôle la disponibilité via la grille en
+étape 2.
 """
 
 from dataclasses import dataclass, field
@@ -20,6 +16,7 @@ from ortools.sat.python import cp_model
 
 from data import (
     DOUBLE_SLOT_PAIRS,
+    SAME_DAY_PAIRS,
     SLOT_MATCO,
     SLOT_MATEX,
     SLOTS,
@@ -51,6 +48,7 @@ class GroupResult:
     groupe_id: int
     students: list[Student]
     slots: list[int]
+    subgroups: dict[str, list[Student]] | None = None  # {"A": [...], "B": [...]} pour SPC/SVT
 
     @property
     def label(self) -> str:
@@ -86,17 +84,9 @@ class SolverResult:
         return result
 
 
-def default_slot_availability(spe: str) -> list[bool]:
-    """
-    Cr1 bloqué pour Maths uniquement (matex = option Maths nécessitant Maths spé).
-    Cr4 bloqué pour tout sauf Maths (matco = option pour élèves sans Maths spé).
-    """
-    avail = [True] * N_SLOTS
-    if spe == "Maths":
-        avail[SLOT_MATEX] = False  # Cr1 : matex sur ce créneau, conflit pour élèves Maths
-    else:
-        avail[SLOT_MATCO] = False  # Cr4 : matco sur ce créneau, libérer pour non-Maths
-    return avail
+def default_slot_availability(spe: str) -> list[bool]:  # noqa: ARG001
+    """Tous les créneaux disponibles par défaut — l'utilisateur ajuste en étape 2."""
+    return [True] * N_SLOTS
 
 
 def build_default_config(parse_result: ParseResult) -> SolverConfig:
@@ -180,13 +170,17 @@ def solve(parse_result: ParseResult, config: SolverConfig) -> SolverResult:
             model.add(sum(slot_var[(spe, g, c)] for c in range(N_SLOTS)) == n_req)
 
     # -----------------------------------------------------------------------
-    # Taille max des groupes (≤ 38)
+    # Taille max (≤ 38) et taille min (≥ floor(N/G)) pour l'équilibre
     # -----------------------------------------------------------------------
     for spe in specialites:
         G = config.nb_groups.get(spe, 1)
         students_in_spe = spe_to_students[spe]
+        min_size = len(students_in_spe) // G
         for g in range(G):
-            model.add(sum(in_group[(idx, spe, g)] for (idx, _) in students_in_spe) <= 38)
+            group_sum = sum(in_group[(idx, spe, g)] for (idx, _) in students_in_spe)
+            model.add(group_sum <= 38)
+            if G > 1 and min_size > 0:
+                model.add(group_sum >= min_size)
 
     # -----------------------------------------------------------------------
     # Anti-conflit : aucun créneau partagé entre les spés d'un même élève
@@ -208,6 +202,19 @@ def solve(parse_result: ParseResult, config: SolverConfig) -> SolverResult:
                                 slot_var[(s1, g1, c)].negated(),
                                 slot_var[(s2, g2, c)].negated(),
                             ])
+
+    # -----------------------------------------------------------------------
+    # Un groupe ne peut pas avoir les deux créneaux d'un même jour
+    # Exception : HLP — ses 3 créneaux {Cr0, Cr5, Cr6} couvrent 2 enseignants
+    # (philo + littérature), avoir Cr5+Cr6 jeudi est intentionnel.
+    # -----------------------------------------------------------------------
+    for spe in specialites:
+        if spe == "HLP":
+            continue
+        G = config.nb_groups.get(spe, 1)
+        for g in range(G):
+            for c_a, c_b in SAME_DAY_PAIRS:
+                model.add(slot_var[(spe, g, c_a)] + slot_var[(spe, g, c_b)] <= 1)
 
     # -----------------------------------------------------------------------
     # HLP-P : seulement lundi (Cr0) et jeudi (Cr5, Cr6)
@@ -332,6 +339,7 @@ def solve(parse_result: ParseResult, config: SolverConfig) -> SolverResult:
             ]
             groups.append(GroupResult(specialite=spe, groupe_id=g, students=members, slots=assigned_slots))
 
+    split_lab_groups(groups)
     n_permanences = _count_permanences(groups)
     stats = {
         "n_students": len(students),
@@ -341,6 +349,19 @@ def solve(parse_result: ParseResult, config: SolverConfig) -> SolverResult:
         "wall_time": round(solver.wall_time, 2),
     }
     return SolverResult(status=status, groups=groups, stats=stats, infeasibility_hints=[])
+
+
+def split_lab_groups(groups: list[GroupResult]) -> list[GroupResult]:
+    """Crée les sous-groupes A/B pour SPC et SVT (split alphabétique)."""
+    for g in groups:
+        if g.specialite in SPE_4_SLOTS:
+            sorted_students = sorted(g.students, key=lambda s: (s.nom, s.prenom))
+            mid = (len(sorted_students) + 1) // 2  # ceil → A toujours ≥ B
+            g.subgroups = {
+                "A": sorted_students[:mid],
+                "B": sorted_students[mid:],
+            }
+    return groups
 
 
 def _count_conflicts(groups: list[GroupResult]) -> int:
@@ -386,6 +407,24 @@ def _infeasibility_hints(
         if n_avail < n_req:
             hints.append(
                 f"{spe} : {n_avail} créneau(x) disponible(s) mais {n_req} requis."
+            )
+            continue
+        # Vérifier les jours disponibles (contrainte "1 créneau max par jour")
+        # Un jour à 2 créneaux ne compte que pour 1 créneau disponible
+        days_avail: set[int] = set()
+        for c, avail_c in enumerate(avail):
+            if avail_c:
+                # Trouver le "jour" de ce créneau : les paires de SAME_DAY_PAIRS partagent le même jour
+                day_id = c
+                for c_a, c_b in SAME_DAY_PAIRS:
+                    if c == c_b:
+                        day_id = c_a  # normalise vers le 1er créneau du jour
+                        break
+                days_avail.add(day_id)
+        if len(days_avail) < n_req:
+            hints.append(
+                f"{spe} : seulement {len(days_avail)} jour(s) disponible(s) "
+                f"mais {n_req} créneaux requis (1 max par jour)."
             )
     if not hints:
         hints.append(
