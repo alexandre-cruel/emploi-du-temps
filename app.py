@@ -211,13 +211,13 @@ def step_config() -> None:
     st.subheader("2b. Créneaux disponibles par spécialité")
     st.caption(
         "Cochez les créneaux utilisables pour chaque spécialité. "
-        "Cr1 (Lundi 15h50) est traditionnellement réservé aux options Maths expertes/DGEMC. "
-        "Cr4 (Mercredi 8h10) est traditionnellement réservé à Maths complémentaires. "
+        "Cr2 (Lundi 15h50) est traditionnellement réservé aux options Maths expertes/DGEMC. "
+        "Cr5 (Mercredi 8h10) est traditionnellement réservé à Maths complémentaires. "
         "Décochez-les si une spécialité ne doit pas utiliser ces créneaux."
     )
 
     col_labels = [
-        f"Cr{c}: {_data.SLOTS[c][1][:2]} {_data.SLOTS[c][2]}"
+        f"Cr{c+1}: {_data.SLOTS[c][1][:2]} {_data.SLOTS[c][2]}"
         for c in range(N_SLOTS)
     ]
 
@@ -268,12 +268,12 @@ def step_config() -> None:
         )
         if maths_common:
             common_options = [
-                f"Cr{c}: {_data.SLOTS[c][1]} {_data.SLOTS[c][2]}"
+                f"Cr{c+1}: {_data.SLOTS[c][1]} {_data.SLOTS[c][2]}"
                 for c in range(N_SLOTS)
                 if slot_avail_input.get("Maths", _solver.default_slot_availability("Maths"))[c]
             ]
             if common_options:
-                default_cr = f"Cr{existing_config.maths_common_slot_idx}: " \
+                default_cr = f"Cr{existing_config.maths_common_slot_idx + 1}: " \
                              f"{_data.SLOTS[existing_config.maths_common_slot_idx][1]} " \
                              f"{_data.SLOTS[existing_config.maths_common_slot_idx][2]}"
                 default_idx = common_options.index(default_cr) if default_cr in common_options else 0
@@ -283,13 +283,22 @@ def step_config() -> None:
                     index=default_idx,
                     key="maths_common_slot",
                 )
-                maths_common_idx = int(selected.split(":")[0].replace("Cr", ""))
+                maths_common_idx = int(selected.split(":")[0].replace("Cr", "")) - 1
             else:
                 maths_common_idx = existing_config.maths_common_slot_idx
         else:
             maths_common_idx = existing_config.maths_common_slot_idx
 
-    timeout = st.slider("Timeout solveur (secondes)", 10, 300, existing_config.timeout_seconds, step=10)
+    timeout = st.slider(
+        "Timeout solveur (secondes)",
+        10, 300, existing_config.timeout_seconds, step=10,
+        help=(
+            "Durée maximale allouée au solveur pour trouver la solution optimale. "
+            "Si ce délai est dépassé, le solveur retourne la meilleure solution trouvée "
+            "jusqu'à cet instant (statut FEASIBLE au lieu de OPTIMAL). "
+            "Augmenter si les groupes semblent déséquilibrés ou si le statut reste FEASIBLE."
+        ),
+    )
 
     st.divider()
     if st.button("Suivant : Résoudre →", type="primary"):
@@ -383,7 +392,7 @@ def step_solve() -> None:
     st.subheader("Effectifs par groupe")
     eff_rows = [
         {"Groupe": g.label, "Effectif": g.effectif,
-         "Créneaux": ", ".join(f"Cr{c}" for c in g.slots)}
+         "Créneaux": ", ".join(f"Cr{c+1}" for c in g.slots)}
         for g in groups
     ]
     df_eff = pd.DataFrame(eff_rows)
@@ -394,36 +403,46 @@ def step_solve() -> None:
     if option_data:
         st.divider()
         with st.expander("🎓 Compatibilité des options", expanded=False):
-            st.caption(
-                "Créneaux libres en commun pour tous les élèves de chaque option, "
-                "compte tenu des créneaux spécialités attribués."
-            )
             OPTION_PREFERRED = {
                 "Maths expertes": _data.SLOT_MATEX,
                 "Maths complémentaires": _data.SLOT_MATCO,
                 "DGEMC": _data.SLOT_MATEX,
             }
+            # Pré-calcule les élèves en conflit par option
+            student_busy = solver_result.get_student_slots()
+            option_to_students: dict[str, list[str]] = {}
+            for s in result.students:
+                for opt in s.options:
+                    option_to_students.setdefault(opt, []).append(f"{s.nom} {s.prenom}")
+
             opt_rows = []
             for opt, info in sorted(option_data.items()):
                 free = info["free_slots"]
-                labels = [
-                    f"Cr{c}: {_data.SLOTS[c][1]} {_data.SLOTS[c][2]}"
-                    for c in free
-                ]
                 preferred = OPTION_PREFERRED.get(opt)
-                if preferred is not None and preferred in free:
-                    status = "✅ créneau habituel libre"
-                elif free:
-                    status = "⚠️ créneau habituel occupé"
+                if preferred is not None:
+                    pref_label = f"Cr{preferred+1} ({_data.SLOTS[preferred][1]} {_data.SLOTS[preferred][2]})"
+                    if preferred in free:
+                        compat = f"✅ Compatible — {pref_label} libre"
+                        n_conflict = 0
+                    else:
+                        n_conflict = sum(
+                            1 for name in option_to_students.get(opt, [])
+                            if preferred in student_busy.get(name, [])
+                        )
+                        compat = f"❌ Conflit — {pref_label} occupé ({n_conflict} élève(s))"
                 else:
-                    status = "❌ aucun créneau libre commun"
+                    compat = "ℹ️ Créneau à définir manuellement"
+                    n_conflict = 0
                 opt_rows.append({
                     "Option": opt,
                     "Nb élèves": info["nb_eleves"],
-                    "Créneaux libres communs": ", ".join(labels) if labels else "—",
-                    "Statut": status,
+                    "Compatibilité": compat,
                 })
             st.dataframe(pd.DataFrame(opt_rows), use_container_width=True, hide_index=True)
+            st.caption(
+                "En cas de conflit : déplacez des élèves entre groupes (étape 4) "
+                "ou planifiez l'option sur un créneau de tronc commun."
+            )
 
     st.divider()
     col_a, col_b, col_c = st.columns(3)
@@ -546,7 +565,7 @@ def step_adjustments() -> None:
                 (spe for spe, slots in slots_per_spe.items() if c in slots), ""
             )
             planning_rows.append({
-                "Créneau": f"Cr{c}",
+                "Créneau": f"Cr{c+1}",
                 "Jour": day,
                 "Horaire": f"{start}–{end}",
                 "Cours": spe_in_slot,
@@ -576,15 +595,6 @@ def step_adjustments() -> None:
                      if g.specialite == spe and g.groupe_id == target_g),
                     []
                 )
-                other_slots: set[int] = set()
-                for s2, gid2 in current_groups.items():
-                    if s2 != spe:
-                        other_slots.update(
-                            g.slots for g in solver_result.groups
-                            if g.specialite == s2 and g.groupe_id == gid2
-                            for _ in [None]  # flatten
-                        )
-                # Flatten
                 other_slots_flat: set[int] = set()
                 for s2, gid2 in current_groups.items():
                     if s2 != spe:

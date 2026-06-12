@@ -300,6 +300,27 @@ def solve(parse_result: ParseResult, config: SolverConfig) -> SolverResult:
                 model.add_bool_or([sb.negated(), sa]).only_enforce_if(only_b.negated())
                 obj_terms.extend([only_a, only_b])
 
+    # Pénalités options : préserver Cr_matex (Cr2) et Cr_matco (Cr5) pour les élèves concernés
+    for spe in specialites:
+        G = config.nb_groups.get(spe, 1)
+        avail = config.slot_availability.get(spe, [True] * N_SLOTS)
+        students_in_spe = spe_to_students[spe]
+        for g in range(G):
+            if avail[SLOT_MATEX]:
+                n_opt = sum(
+                    1 for (_, st) in students_in_spe
+                    if any(o in ("Maths expertes", "DGEMC") for o in st.options)
+                )
+                if n_opt > 0:
+                    obj_terms.append(slot_var[(spe, g, SLOT_MATEX)] * min(n_opt, 5))
+            if avail[SLOT_MATCO]:
+                n_opt = sum(
+                    1 for (_, st) in students_in_spe
+                    if "Maths complémentaires" in st.options
+                )
+                if n_opt > 0:
+                    obj_terms.append(slot_var[(spe, g, SLOT_MATCO)] * min(n_opt, 5))
+
     if obj_terms:
         model.minimize(sum(obj_terms))
 

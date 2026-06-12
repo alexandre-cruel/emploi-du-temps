@@ -155,7 +155,7 @@ def test_real_data_hlp_on_allowed_days():
     for g in result.groups:
         if g.specialite == "HLP":
             for c in g.slots:
-                assert c in ALLOWED_HLP, f"HLP slot Cr{c} interdit (doit être Lundi ou Jeudi)"
+                assert c in ALLOWED_HLP, f"HLP slot Cr{c+1} interdit (doit être Lundi ou Jeudi)"
 
 
 def test_real_data_maths_common_slot():
@@ -189,7 +189,7 @@ def test_no_double_slot_same_day():
             continue
         for c_a, c_b in SAME_DAY_PAIRS:
             assert not (c_a in g.slots and c_b in g.slots), (
-                f"{g.label} utilise Cr{c_a} ET Cr{c_b} (même jour)"
+                f"{g.label} utilise Cr{c_a+1} ET Cr{c_b+1} (même jour)"
             )
 
 
@@ -214,9 +214,7 @@ def test_min_group_size():
             continue
         min_size = spe_students[spe] // G
         for e in effectifs:
-            assert e >= min_size, (
-                f"{spe} : groupe avec {e} élèves < min_size={min_size}"
-            )
+            assert e >= min_size, f"{spe} : groupe de {e} < min_size={min_size}"
 
 
 # ---------------------------------------------------------------------------
@@ -273,6 +271,6 @@ def test_real_data_subgroups_created():
     result = solve(pr, config)
     for g in result.groups:
         if g.specialite in SPE_4_SLOTS:
-            assert g.subgroups is not None, f"{g.label} n'a pas de sous-groupes"
+            assert g.subgroups is not None, f"{g.label} : sous-groupes manquants"
             assert len(g.subgroups.get("A", [])) > 0
             assert len(g.subgroups.get("B", [])) > 0
