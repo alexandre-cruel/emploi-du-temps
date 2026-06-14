@@ -18,30 +18,81 @@ import export as _export
 N_SLOTS = len(_data.SLOTS)
 
 
-def _compute_option_slots(
+# Créneaux habituels pour les options connues (index 0-based interne)
+_OPTION_DEFAULT_SLOT: dict[str, int] = {
+    "Maths expertes": _data.SLOT_MATEX,
+    "DGEMC": _data.SLOT_MATEX,
+    "Maths complémentaires": _data.SLOT_MATCO,
+}
+
+
+def _option_panel(
     solver_result: _solver.SolverResult,
     parse_result: _data.ParseResult,
-) -> dict[str, dict]:
-    """Calcule les créneaux libres communs pour chaque option post-résolution."""
+) -> None:
+    """Panneau interactif de placement des options post-résolution."""
     student_busy = solver_result.get_student_slots()
+    student_groups = solver_result.get_student_groups()
 
     option_to_students: dict[str, list[str]] = {}
     for s in parse_result.students:
         for opt in s.options:
             option_to_students.setdefault(opt, []).append(f"{s.nom} {s.prenom}")
 
-    all_slots = set(range(N_SLOTS))
-    result: dict[str, dict] = {}
-    for opt, names in option_to_students.items():
-        free = all_slots.copy()
-        for name in names:
-            busy = set(student_busy.get(name, []))
-            free &= (all_slots - busy)
-        result[opt] = {
-            "nb_eleves": len(names),
-            "free_slots": sorted(free),
-        }
-    return result
+    if not option_to_students:
+        st.caption("Aucune option déclarée dans le fichier.")
+        return
+
+    slot_options = [
+        f"Cr{c+1}: {_data.SLOTS[c][1]} {_data.SLOTS[c][2]}"
+        for c in range(N_SLOTS)
+    ]
+
+    for opt, names in sorted(option_to_students.items()):
+        default_idx = _OPTION_DEFAULT_SLOT.get(opt, 0)
+        col_sel, col_stat = st.columns([3, 2])
+        with col_sel:
+            chosen = st.selectbox(
+                f"**{opt}** ({len(names)} élèves)",
+                slot_options,
+                index=default_idx,
+                key=f"opt_slot_{opt}",
+            )
+        chosen_c = int(chosen.split(":")[0].replace("Cr", "")) - 1
+
+        compatible = [n for n in names if chosen_c not in student_busy.get(n, [])]
+        conflict = [n for n in names if chosen_c in student_busy.get(n, [])]
+        ratio = len(compatible) / len(names) if names else 1.0
+
+        with col_stat:
+            st.markdown("")  # alignement vertical
+            if ratio == 1.0:
+                st.success(f"✅ {len(compatible)}/{len(names)} compatibles")
+            elif ratio >= 0.8:
+                st.warning(f"⚠️ {len(compatible)}/{len(names)} compatibles")
+            else:
+                st.error(f"❌ {len(compatible)}/{len(names)} compatibles")
+
+        if conflict:
+            with st.expander(f"  {len(conflict)} élève(s) en conflit sur ce créneau"):
+                rows = []
+                for name in conflict:
+                    grps = student_groups.get(name, [])
+                    blocking = next(
+                        (g.label for g in grps if chosen_c in g.slots), "?"
+                    )
+                    parts = name.split(" ", 1)
+                    rows.append({
+                        "Nom": parts[0],
+                        "Prénom": parts[1] if len(parts) > 1 else "",
+                        "Cours qui occupe le créneau": blocking,
+                    })
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    st.caption(
+        "En cas de conflit : déplacez les élèves concernés vers un autre groupe "
+        "en étape 4, ou planifiez l'option sur un créneau de tronc commun."
+    )
 
 st.set_page_config(
     page_title="Emploi du temps lycée",
@@ -398,51 +449,12 @@ def step_solve() -> None:
     df_eff = pd.DataFrame(eff_rows)
     st.dataframe(df_eff, use_container_width=True, hide_index=True)
 
-    # Compatibilité des options
-    option_data = _compute_option_slots(solver_result, result)
-    if option_data:
+    # Panneau options interactif
+    has_options = any(s.options for s in result.students)
+    if has_options:
         st.divider()
-        with st.expander("🎓 Compatibilité des options", expanded=False):
-            OPTION_PREFERRED = {
-                "Maths expertes": _data.SLOT_MATEX,
-                "Maths complémentaires": _data.SLOT_MATCO,
-                "DGEMC": _data.SLOT_MATEX,
-            }
-            # Pré-calcule les élèves en conflit par option
-            student_busy = solver_result.get_student_slots()
-            option_to_students: dict[str, list[str]] = {}
-            for s in result.students:
-                for opt in s.options:
-                    option_to_students.setdefault(opt, []).append(f"{s.nom} {s.prenom}")
-
-            opt_rows = []
-            for opt, info in sorted(option_data.items()):
-                free = info["free_slots"]
-                preferred = OPTION_PREFERRED.get(opt)
-                if preferred is not None:
-                    pref_label = f"Cr{preferred+1} ({_data.SLOTS[preferred][1]} {_data.SLOTS[preferred][2]})"
-                    if preferred in free:
-                        compat = f"✅ Compatible — {pref_label} libre"
-                        n_conflict = 0
-                    else:
-                        n_conflict = sum(
-                            1 for name in option_to_students.get(opt, [])
-                            if preferred in student_busy.get(name, [])
-                        )
-                        compat = f"❌ Conflit — {pref_label} occupé ({n_conflict} élève(s))"
-                else:
-                    compat = "ℹ️ Créneau à définir manuellement"
-                    n_conflict = 0
-                opt_rows.append({
-                    "Option": opt,
-                    "Nb élèves": info["nb_eleves"],
-                    "Compatibilité": compat,
-                })
-            st.dataframe(pd.DataFrame(opt_rows), use_container_width=True, hide_index=True)
-            st.caption(
-                "En cas de conflit : déplacez des élèves entre groupes (étape 4) "
-                "ou planifiez l'option sur un créneau de tronc commun."
-            )
+        with st.expander("🎓 Options — simuler le placement", expanded=False):
+            _option_panel(solver_result, result)
 
     st.divider()
     col_a, col_b, col_c = st.columns(3)
