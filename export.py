@@ -72,14 +72,29 @@ def _sheet_planning_groupes(wb: openpyxl.Workbook, result: SolverResult) -> None
 
     groups = sorted(result.groups, key=lambda g: (g.specialite, g.groupe_id))
 
-    # Construit les colonnes : groupes normaux + sous-groupes A/B pour SPC/SVT
-    col_entries: list[tuple[str, str, list[int]]] = []  # (label, spe, slots)
+    # col_entries : (header_label, spe, slot_idx → cell_label)
+    # Pour SPC/SVT : colonne par sous-groupe, avec label "cours" ou "TP"
+    col_entries: list[tuple[str, str, dict[int, str]]] = []
     for g in groups:
-        if g.specialite in SPE_4_SLOTS and g.subgroups:
+        if g.specialite in SPE_4_SLOTS and g.subgroups and g.tp_pair:
+            tp_a, tp_b = g.tp_pair
             for letter in ("A", "B"):
-                col_entries.append((f"{g.label}{letter}", g.specialite, g.slots))
+                slot_labels: dict[int, str] = {}
+                for c in g.slots:
+                    if c == tp_a:
+                        slot_labels[c] = f"{g.label}{'A' if letter == 'A' else 'B'} TP"
+                    elif c == tp_b:
+                        # Seul le sous-groupe correspondant au slot c_b a cours ici
+                        slot_labels[c] = f"{g.label}B TP" if letter == "B" else ""
+                    else:
+                        slot_labels[c] = f"{g.label} cours"
+                col_entries.append((f"{g.label}{letter}", g.specialite, slot_labels))
+        elif g.specialite in SPE_4_SLOTS and g.subgroups:
+            # tp_pair pas détectée (rare) : fallback sans distinction
+            for letter in ("A", "B"):
+                col_entries.append((f"{g.label}{letter}", g.specialite, {c: g.label for c in g.slots}))
         else:
-            col_entries.append((g.label, g.specialite, g.slots))
+            col_entries.append((g.label, g.specialite, {c: g.label for c in g.slots}))
 
     ws.column_dimensions["A"].width = 14
     ws.column_dimensions["B"].width = 18
@@ -90,16 +105,17 @@ def _sheet_planning_groupes(wb: openpyxl.Workbook, result: SolverResult) -> None
         cell.fill = HEADER_FILL
         cell.font = HEADER_FONT
         cell.alignment = _centered()
-        ws.column_dimensions[get_column_letter(col)].width = 16
+        ws.column_dimensions[get_column_letter(col)].width = 18
 
     for row_idx, (slot_idx, day, start, end) in enumerate(SLOTS, start=2):
         ws.cell(row=row_idx, column=1, value=f"{day}").alignment = _centered()
         ws.cell(row=row_idx, column=2, value=f"{start}–{end}").alignment = _centered()
 
-        for col_idx, (label, spe, slots) in enumerate(col_entries, start=3):
-            if slot_idx in slots:
+        for col_idx, (_, spe, slot_labels) in enumerate(col_entries, start=3):
+            cell_label = slot_labels.get(slot_idx, "")
+            if cell_label:
                 color = SPE_COLORS.get(spe, DEFAULT_COLOR)
-                cell = ws.cell(row=row_idx, column=col_idx, value=label)
+                cell = ws.cell(row=row_idx, column=col_idx, value=cell_label)
                 cell.fill = _fill(color)
                 cell.alignment = _centered()
                 cell.font = _bold()
@@ -160,17 +176,28 @@ def _sheet_planning_eleves(
         ws.cell(row=row_idx, column=4, value=", ".join(st_obj.options) if st_obj.options else "")
         ws.cell(row=row_idx, column=5, value=student_subgroup.get(name, ""))
 
+        letter = student_subgroup.get(name, "")
         for slot_idx in slots:
             col = 6 + slot_idx
             spe_label = ""
             for g in grps:
                 if slot_idx in g.slots:
-                    spe_label = g.label
+                    if g.specialite in SPE_4_SLOTS and g.tp_pair:
+                        tp_a, tp_b = g.tp_pair
+                        if slot_idx == tp_a:
+                            spe_label = f"{g.label}A TP" if letter == "A" else ""
+                        elif slot_idx == tp_b:
+                            spe_label = f"{g.label}B TP" if letter == "B" else ""
+                        else:
+                            spe_label = f"{g.label} cours"
+                    else:
+                        spe_label = g.label
                     break
+            if not spe_label:
+                continue
             cell = ws.cell(row=row_idx, column=col, value=spe_label)
-            if spe_label:
-                spe = spe_label.split()[0]
-                cell.fill = _fill(SPE_COLORS.get(spe, DEFAULT_COLOR))
+            spe = spe_label.split()[0]
+            cell.fill = _fill(SPE_COLORS.get(spe, DEFAULT_COLOR))
             cell.alignment = _centered()
 
         ws.cell(row=row_idx, column=6 + len(SLOTS), value=len(slots))

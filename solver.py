@@ -15,7 +15,10 @@ from typing import Any
 from ortools.sat.python import cp_model
 
 from data import (
+    AUTRE_SLOTS,
     DOUBLE_SLOT_PAIRS,
+    JEUDI_SLOTS,
+    LUNDI_SLOTS,
     SAME_DAY_PAIRS,
     SLOT_MATCO,
     SLOT_MATEX,
@@ -49,6 +52,7 @@ class GroupResult:
     students: list[Student]
     slots: list[int]
     subgroups: dict[str, list[Student]] | None = None  # {"A": [...], "B": [...]} pour SPC/SVT
+    tp_pair: tuple[int, int] | None = None  # (c_a, c_b) : paire de créneaux TP pour SPC/SVT
 
     @property
     def label(self) -> str:
@@ -205,11 +209,10 @@ def solve(parse_result: ParseResult, config: SolverConfig) -> SolverResult:
 
     # -----------------------------------------------------------------------
     # Un groupe ne peut pas avoir les deux créneaux d'un même jour
-    # Exception : HLP — ses 3 créneaux {Cr0, Cr5, Cr6} couvrent 2 enseignants
-    # (philo + littérature), avoir Cr5+Cr6 jeudi est intentionnel.
+    # Exception SPC/SVT : ils ont une paire TP (même jour obligatoire) — gérée séparément
     # -----------------------------------------------------------------------
     for spe in specialites:
-        if spe == "HLP":
+        if spe in SPE_4_SLOTS:
             continue
         G = config.nb_groups.get(spe, 1)
         for g in range(G):
@@ -217,15 +220,49 @@ def solve(parse_result: ParseResult, config: SolverConfig) -> SolverResult:
                 model.add(slot_var[(spe, g, c_a)] + slot_var[(spe, g, c_b)] <= 1)
 
     # -----------------------------------------------------------------------
-    # HLP-P : seulement lundi (Cr0) et jeudi (Cr5, Cr6)
+    # SPC/SVT : exactement 1 paire TP (même jour, 2 créneaux consécutifs)
+    # Les 2 autres créneaux sont des cours (groupe entier, 1 seul par jour)
     # -----------------------------------------------------------------------
-    ALLOWED_HLP = {0, 5, 6}
+    for spe in SPE_4_SLOTS:
+        if spe not in specialites:
+            continue
+        G = config.nb_groups.get(spe, 1)
+        avail = config.slot_availability.get(spe, [True] * N_SLOTS)
+        for g in range(G):
+            pair_used: list[cp_model.BoolVar] = []
+            for c_a, c_b in SAME_DAY_PAIRS:
+                pv = model.new_bool_var(f"tp_{spe}_{g}_{c_a}")
+                # Si pv=1 → les deux créneaux du jour sont utilisés (paire TP)
+                model.add(slot_var[(spe, g, c_a)] + slot_var[(spe, g, c_b)] == 2).only_enforce_if(pv)
+                model.add(slot_var[(spe, g, c_a)] + slot_var[(spe, g, c_b)] <= 1).only_enforce_if(pv.negated())
+                # Si l'un des deux créneaux est indisponible, la paire ne peut pas être choisie
+                if not avail[c_a] or not avail[c_b]:
+                    model.add(pv == 0)
+                pair_used.append(pv)
+            model.add(sum(pair_used) == 1)  # exactement 1 jour TP
+
+    # -----------------------------------------------------------------------
+    # HLP : 1 slot Lundi + 1 slot Jeudi + 1 slot autre jour (Mardi/Merc/Vend)
+    # Prof philo (Lundi+Jeudi), prof littérature (tous jours)
+    # -----------------------------------------------------------------------
     if config.constraint_hlp_philo_days and "HLP" in specialites:
         G = config.nb_groups.get("HLP", 1)
         for g in range(G):
+            avail = config.slot_availability.get("HLP", [True] * N_SLOTS)
+            lundi_avail = [c for c in LUNDI_SLOTS if avail[c]]
+            jeudi_avail = [c for c in JEUDI_SLOTS if avail[c]]
+            autre_avail = [c for c in AUTRE_SLOTS if avail[c]]
+            # Bloquer les créneaux hors des 3 jours autorisés
             for c in range(N_SLOTS):
-                if c not in ALLOWED_HLP:
+                if c not in LUNDI_SLOTS | JEUDI_SLOTS | AUTRE_SLOTS:
                     model.add(slot_var[("HLP", g, c)] == 0)
+            # Exactement 1 slot par groupe de jour (si des créneaux sont disponibles)
+            if lundi_avail:
+                model.add(sum(slot_var[("HLP", g, c)] for c in lundi_avail) == 1)
+            if jeudi_avail:
+                model.add(sum(slot_var[("HLP", g, c)] for c in jeudi_avail) == 1)
+            if autre_avail:
+                model.add(sum(slot_var[("HLP", g, c)] for c in autre_avail) == 1)
 
     # -----------------------------------------------------------------------
     # Maths créneau commun (Cr4 Mercredi par défaut)
@@ -298,7 +335,7 @@ def solve(parse_result: ParseResult, config: SolverConfig) -> SolverResult:
                 # only_b = sb AND NOT sa
                 model.add_bool_and([sb, sa.negated()]).only_enforce_if(only_b)
                 model.add_bool_or([sb.negated(), sa]).only_enforce_if(only_b.negated())
-                obj_terms.extend([only_a, only_b])
+                obj_terms.extend([only_a * 5, only_b * 5])
 
     if obj_terms:
         model.minimize(sum(obj_terms))
@@ -308,8 +345,9 @@ def solve(parse_result: ParseResult, config: SolverConfig) -> SolverResult:
     # -----------------------------------------------------------------------
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = config.timeout_seconds
-    solver.parameters.num_workers = 8
+    solver.parameters.num_workers = 1  # 1 worker = déterminisme strict avec random_seed
     solver.parameters.log_search_progress = False
+    solver.parameters.random_seed = 42
 
     status_code = solver.solve(model)
     status_map = {
@@ -352,7 +390,7 @@ def solve(parse_result: ParseResult, config: SolverConfig) -> SolverResult:
 
 
 def split_lab_groups(groups: list[GroupResult]) -> list[GroupResult]:
-    """Crée les sous-groupes A/B pour SPC et SVT (split alphabétique)."""
+    """Crée les sous-groupes A/B pour SPC et SVT (split alphabétique) et identifie la paire TP."""
     for g in groups:
         if g.specialite in SPE_4_SLOTS:
             sorted_students = sorted(g.students, key=lambda s: (s.nom, s.prenom))
@@ -361,6 +399,12 @@ def split_lab_groups(groups: list[GroupResult]) -> list[GroupResult]:
                 "A": sorted_students[:mid],
                 "B": sorted_students[mid:],
             }
+            # Identifier la paire TP : les 2 slots du même jour
+            slots_set = set(g.slots)
+            for c_a, c_b in SAME_DAY_PAIRS:
+                if c_a in slots_set and c_b in slots_set:
+                    g.tp_pair = (c_a, c_b)
+                    break
     return groups
 
 

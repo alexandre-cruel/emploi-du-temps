@@ -37,6 +37,11 @@ DOUBLE_SLOT_PAIRS: list[tuple[int, int]] = [(2, 3), (5, 6), (7, 8)]
 # Toutes les paires du même jour (y compris lundi apr-midi) — pour contrainte "1 créneau/jour max"
 SAME_DAY_PAIRS: list[tuple[int, int]] = [(0, 1), (2, 3), (5, 6), (7, 8)]
 
+# Groupes de créneaux par jour — pour contrainte HLP (1 par jour obligatoire)
+LUNDI_SLOTS: frozenset[int] = frozenset({0, 1})
+JEUDI_SLOTS: frozenset[int] = frozenset({5, 6})
+AUTRE_SLOTS: frozenset[int] = frozenset({2, 3, 4, 7, 8})  # Mardi, Mercredi, Vendredi
+
 # Mapping normalisation des noms de spécialités (tels qu'ils apparaissent dans le fichier)
 _SPE_ALIASES: dict[str, str] = {
     "M": "Maths", "MATHS": "Maths", "MATH": "Maths",

@@ -3,7 +3,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import pytest
-from data import Student, ParseResult, SLOTS, SAME_DAY_PAIRS, SPE_4_SLOTS
+from data import Student, ParseResult, SLOTS, SAME_DAY_PAIRS, SPE_4_SLOTS, LUNDI_SLOTS, JEUDI_SLOTS, AUTRE_SLOTS
 from solver import (
     SolverConfig,
     GroupResult,
@@ -147,15 +147,20 @@ def test_real_data_all_students_placed():
 
 
 def test_real_data_hlp_on_allowed_days():
+    """HLP : exactement 1 slot Lundi, 1 slot Jeudi, 1 slot autre jour (jamais 2 le même jour)."""
     from data import parse_xlsx
     pr = parse_xlsx(XLSX_PATH)
     config = build_default_config(pr)
     result = solve(pr, config)
-    ALLOWED_HLP = {0, 5, 6}  # Lundi, Jeudi
     for g in result.groups:
         if g.specialite == "HLP":
-            for c in g.slots:
-                assert c in ALLOWED_HLP, f"HLP slot Cr{c+1} interdit (doit être Lundi ou Jeudi)"
+            slots = set(g.slots)
+            n_lundi = len(slots & LUNDI_SLOTS)
+            n_jeudi = len(slots & JEUDI_SLOTS)
+            n_autre = len(slots & AUTRE_SLOTS)
+            assert n_lundi == 1, f"HLP groupe {g.groupe_id+1} : {n_lundi} slot(s) Lundi (attendu 1)"
+            assert n_jeudi == 1, f"HLP groupe {g.groupe_id+1} : {n_jeudi} slot(s) Jeudi (attendu 1)"
+            assert n_autre == 1, f"HLP groupe {g.groupe_id+1} : {n_autre} slot(s) autre jour (attendu 1)"
 
 
 def test_real_data_maths_common_slot():
@@ -177,20 +182,25 @@ def test_real_data_maths_common_slot():
 # ---------------------------------------------------------------------------
 
 def test_no_double_slot_same_day():
-    """Aucun groupe (sauf HLP) ne doit avoir les deux créneaux d'un même jour.
-    HLP est une exception : ses 3 créneaux {Cr0, Cr5, Cr6} incluent intentionnellement
-    Cr5+Cr6 le jeudi (2 enseignants — philo + littérature)."""
+    """Aucun groupe (hors SPC/SVT) ne doit avoir 2 créneaux le même jour.
+    SPC/SVT ont exactement 1 paire TP (même jour autorisé)."""
     from data import parse_xlsx
     pr = parse_xlsx(XLSX_PATH)
     config = build_default_config(pr)
     result = solve(pr, config)
     for g in result.groups:
-        if g.specialite == "HLP":
-            continue
-        for c_a, c_b in SAME_DAY_PAIRS:
-            assert not (c_a in g.slots and c_b in g.slots), (
-                f"{g.label} utilise Cr{c_a+1} ET Cr{c_b+1} (même jour)"
+        if g.specialite in SPE_4_SLOTS:
+            # Doit avoir exactement 1 paire de même jour
+            pairs_found = sum(
+                1 for c_a, c_b in SAME_DAY_PAIRS
+                if c_a in g.slots and c_b in g.slots
             )
+            assert pairs_found == 1, f"{g.label} : {pairs_found} paire(s) TP (attendu exactement 1)"
+        else:
+            for c_a, c_b in SAME_DAY_PAIRS:
+                assert not (c_a in g.slots and c_b in g.slots), (
+                    f"{g.label} utilise Cr{c_a+1} ET Cr{c_b+1} (même jour)"
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -274,3 +284,29 @@ def test_real_data_subgroups_created():
             assert g.subgroups is not None, f"{g.label} : sous-groupes manquants"
             assert len(g.subgroups.get("A", [])) > 0
             assert len(g.subgroups.get("B", [])) > 0
+
+
+def test_spc_svt_has_tp_pair():
+    """Chaque groupe SPC/SVT a exactement 1 paire TP identifiée (tp_pair)."""
+    from data import parse_xlsx
+    pr = parse_xlsx(XLSX_PATH)
+    config = build_default_config(pr)
+    result = solve(pr, config)
+    for g in result.groups:
+        if g.specialite in SPE_4_SLOTS:
+            assert g.tp_pair is not None, f"{g.label} : tp_pair manquant"
+            c_a, c_b = g.tp_pair
+            assert c_a in g.slots and c_b in g.slots, f"{g.label} : tp_pair {g.tp_pair} pas dans les slots {g.slots}"
+
+
+def test_determinism():
+    """Deux runs avec les mêmes settings donnent exactement les mêmes slots."""
+    from data import parse_xlsx
+    pr = parse_xlsx(XLSX_PATH)
+    config = build_default_config(pr)
+    r1 = solve(pr, config)
+    r2 = solve(pr, config)
+    assert r1.status == r2.status
+    slots1 = {g.label: sorted(g.slots) for g in r1.groups}
+    slots2 = {g.label: sorted(g.slots) for g in r2.groups}
+    assert slots1 == slots2, "Les deux runs donnent des slots différents (non-déterministe)"
