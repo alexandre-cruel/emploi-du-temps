@@ -422,7 +422,17 @@ def step_solve() -> None:
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Élèves", stats.get("n_students", ""))
     col2.metric("Conflits", stats.get("n_conflicts", 0), delta_color="inverse")
-    col3.metric("Permanences", stats.get("n_permanences", 0), delta_color="inverse")
+    col3.metric(
+        "Permanences",
+        stats.get("n_permanences", 0),
+        delta_color="inverse",
+        help=(
+            "Nombre d'élèves ayant au moins un demi-journée isolée : "
+            "ils ont cours sur un seul des deux créneaux d'une même matinée "
+            "(ex. Mardi 8h mais pas Mardi 10h), ce qui génère une permanence. "
+            "Le solveur cherche à minimiser ce nombre."
+        ),
+    )
     col4.metric("Temps (s)", stats.get("wall_time", ""))
 
     st.divider()
@@ -691,7 +701,16 @@ def step_export() -> None:
     stats = final_result.stats
     col1, col2, col3 = st.columns(3)
     col1.metric("Conflits", stats.get("n_conflicts", 0))
-    col2.metric("Permanences", stats.get("n_permanences", 0))
+    col2.metric(
+        "Permanences",
+        stats.get("n_permanences", 0),
+        help=(
+            "Nombre d'élèves ayant au moins un demi-journée isolée : "
+            "ils ont cours sur un seul des deux créneaux d'une même matinée "
+            "(ex. Mardi 8h mais pas Mardi 10h), ce qui génère une permanence. "
+            "Le solveur cherche à minimiser ce nombre."
+        ),
+    )
     col3.metric("Statut", final_result.status)
 
     if stats.get("n_conflicts", 0) > 0:
