@@ -9,7 +9,7 @@ XLSX_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "TERMINALES
 
 
 def test_slots_count():
-    assert N_SLOTS == 9
+    assert N_SLOTS == 10
 
 
 def test_normalize_spe():

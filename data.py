@@ -21,6 +21,7 @@ SLOTS: list[tuple[int, str, str, str]] = [
     (6, "Jeudi",    "10h15", "12h05"),
     (7, "Vendredi", "8h10",  "10h00"),
     (8, "Vendredi", "10h15", "12h05"),
+    (9, "Lundi",    "13h00", "14h55"),  # créneau optionnel Lundi (avant Cr1, pour SVT)
 ]
 
 SLOT_LABELS = [f"J{i+1} – {day} {start}-{end}" for i, (_, day, start, end) in enumerate(SLOTS)]
@@ -34,11 +35,17 @@ N_SLOTS = len(SLOTS)
 # Paires de créneaux sur le même jour (pour permanences — matin uniquement)
 DOUBLE_SLOT_PAIRS: list[tuple[int, int]] = [(2, 3), (5, 6), (7, 8)]
 
-# Toutes les paires du même jour (y compris lundi apr-midi) — pour contrainte "1 créneau/jour max"
-SAME_DAY_PAIRS: list[tuple[int, int]] = [(0, 1), (2, 3), (5, 6), (7, 8)]
+# Toutes les paires du même jour — pour contrainte "1 créneau/jour max" (non-SPC/SVT)
+# Slot 9 (Lundi 13h00) chevauche slot 0 (Lundi 13h55) → (9,0) et (9,1) sont des paires bloquantes
+SAME_DAY_PAIRS: list[tuple[int, int]] = [(0, 1), (0, 9), (1, 9), (2, 3), (5, 6), (7, 8)]
+
+# Paires TP valides pour SPC/SVT (même jour, sans chevauchement horaire)
+# (9,0) EXCLU : 13h00-14h55 chevauche 13h55-15h50
+# (9,1) INCLUS : 13h00-14h55 puis 15h50-17h50 — A d'abord, B ensuite (pas de conflit)
+VALID_TP_PAIRS: list[tuple[int, int]] = [(9, 1), (0, 1), (2, 3), (5, 6), (7, 8)]
 
 # Groupes de créneaux par jour — pour contrainte HLP (1 par jour obligatoire)
-LUNDI_SLOTS: frozenset[int] = frozenset({0, 1})
+LUNDI_SLOTS: frozenset[int] = frozenset({0, 1, 9})
 JEUDI_SLOTS: frozenset[int] = frozenset({5, 6})
 AUTRE_SLOTS: frozenset[int] = frozenset({2, 3, 4, 7, 8})  # Mardi, Mercredi, Vendredi
 

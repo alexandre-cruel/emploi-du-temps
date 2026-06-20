@@ -24,6 +24,7 @@ from data import (
     SLOT_MATEX,
     SLOTS,
     SPE_4_SLOTS,
+    VALID_TP_PAIRS,
     ParseResult,
     Student,
 )
@@ -43,6 +44,7 @@ class SolverConfig:
 
     timeout_seconds: int = 60
     niveau: str = "Terminale"
+    deterministic_mode: bool = False  # True = 1 worker (reproductible), False = 4 workers (rapide)
 
 
 @dataclass
@@ -220,9 +222,11 @@ def solve(parse_result: ParseResult, config: SolverConfig) -> SolverResult:
                 model.add(slot_var[(spe, g, c_a)] + slot_var[(spe, g, c_b)] <= 1)
 
     # -----------------------------------------------------------------------
-    # SPC/SVT : exactement 1 paire TP (même jour, 2 créneaux consécutifs)
+    # SPC/SVT : exactement 1 paire TP (même jour, sans chevauchement horaire)
     # Les 2 autres créneaux sont des cours (groupe entier, 1 seul par jour)
+    # Utilise VALID_TP_PAIRS (sous-ensemble de SAME_DAY_PAIRS sans les paires qui se chevauchent)
     # -----------------------------------------------------------------------
+    _valid_tp_sets = {frozenset(p) for p in VALID_TP_PAIRS}
     for spe in SPE_4_SLOTS:
         if spe not in specialites:
             continue
@@ -230,7 +234,7 @@ def solve(parse_result: ParseResult, config: SolverConfig) -> SolverResult:
         avail = config.slot_availability.get(spe, [True] * N_SLOTS)
         for g in range(G):
             pair_used: list[cp_model.BoolVar] = []
-            for c_a, c_b in SAME_DAY_PAIRS:
+            for c_a, c_b in VALID_TP_PAIRS:
                 pv = model.new_bool_var(f"tp_{spe}_{g}_{c_a}")
                 # Si pv=1 → les deux créneaux du jour sont utilisés (paire TP)
                 model.add(slot_var[(spe, g, c_a)] + slot_var[(spe, g, c_b)] == 2).only_enforce_if(pv)
@@ -240,6 +244,11 @@ def solve(parse_result: ParseResult, config: SolverConfig) -> SolverResult:
                     model.add(pv == 0)
                 pair_used.append(pv)
             model.add(sum(pair_used) == 1)  # exactement 1 jour TP
+            # Bloquer les paires du même jour qui ne sont PAS des paires TP valides
+            # (ex: slot 0 et slot 9 se chevauchent → ne peuvent jamais être 2 cours le même jour)
+            for c_a, c_b in SAME_DAY_PAIRS:
+                if frozenset((c_a, c_b)) not in _valid_tp_sets:
+                    model.add(slot_var[(spe, g, c_a)] + slot_var[(spe, g, c_b)] <= 1)
 
     # -----------------------------------------------------------------------
     # HLP : 1 slot Lundi + 1 slot Jeudi + 1 slot autre jour (Mardi/Merc/Vend)
@@ -345,9 +354,12 @@ def solve(parse_result: ParseResult, config: SolverConfig) -> SolverResult:
     # -----------------------------------------------------------------------
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = config.timeout_seconds
-    solver.parameters.num_workers = 1  # 1 worker = déterminisme strict avec random_seed
     solver.parameters.log_search_progress = False
-    solver.parameters.random_seed = 42
+    if config.deterministic_mode:
+        solver.parameters.num_workers = 1
+        solver.parameters.random_seed = 42
+    else:
+        solver.parameters.num_workers = 4
 
     status_code = solver.solve(model)
     status_map = {
@@ -399,9 +411,9 @@ def split_lab_groups(groups: list[GroupResult]) -> list[GroupResult]:
                 "A": sorted_students[:mid],
                 "B": sorted_students[mid:],
             }
-            # Identifier la paire TP : les 2 slots du même jour
+            # Identifier la paire TP parmi les paires valides (sans chevauchement)
             slots_set = set(g.slots)
-            for c_a, c_b in SAME_DAY_PAIRS:
+            for c_a, c_b in VALID_TP_PAIRS:
                 if c_a in slots_set and c_b in slots_set:
                     g.tp_pair = (c_a, c_b)
                     break

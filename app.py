@@ -351,6 +351,17 @@ def step_config() -> None:
         ),
     )
 
+    deterministic_mode = st.toggle(
+        "Mode déterministe",
+        value=getattr(existing_config, "deterministic_mode", False),
+        help=(
+            "Désactivé (recommandé) : 4 threads en parallèle — trouve une solution ~4× plus vite. "
+            "Les créneaux peuvent légèrement varier d'un run à l'autre.\n"
+            "Activé : 1 thread — résultat identique à chaque run, mais plus lent. "
+            "À utiliser uniquement si vous avez besoin de reproductibilité exacte."
+        ),
+    )
+
     st.divider()
     if st.button("Suivant : Résoudre →", type="primary"):
         new_config = _solver.SolverConfig(
@@ -362,6 +373,7 @@ def step_config() -> None:
             maths_common_slot_idx=maths_common_idx,
             timeout_seconds=timeout,
             niveau=result.niveau,
+            deterministic_mode=deterministic_mode,
         )
         st.session_state["config"] = new_config
         st.session_state["solver_result"] = None  # reset
@@ -400,12 +412,28 @@ def step_solve() -> None:
         st.success("✅ Solution optimale trouvée !")
     elif status == "FEASIBLE":
         st.warning("⚠️ Solution trouvée (non optimale — timeout atteint).")
-    else:
-        st.error(f"❌ Aucune solution trouvée ({status}).")
+    elif status == "INFEASIBLE":
+        st.error("❌ Aucune solution possible (INFEASIBLE).")
         if solver_result.infeasibility_hints:
             st.subheader("Causes possibles :")
             for h in solver_result.infeasibility_hints:
                 st.markdown(f"- {h}")
+        col_a, col_b = st.columns(2)
+        with col_a:
+            if st.button("← Modifier la configuration"):
+                _go_step(2)
+                st.rerun()
+        with col_b:
+            if st.button("🔄 Relancer"):
+                st.session_state["solver_result"] = None
+                st.rerun()
+    else:
+        st.error(f"❌ Temps écoulé sans trouver de solution ({status}).")
+        st.info(
+            "Le problème n'est pas prouvé infaisable — le solveur a simplement manqué de temps. "
+            "Essayez : augmenter le timeout en étape 2, ou désactiver le mode déterministe "
+            "(4 workers = ~4× plus rapide)."
+        )
         col_a, col_b = st.columns(2)
         with col_a:
             if st.button("← Modifier la configuration"):

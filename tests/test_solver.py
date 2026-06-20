@@ -3,7 +3,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import pytest
-from data import Student, ParseResult, SLOTS, SAME_DAY_PAIRS, SPE_4_SLOTS, LUNDI_SLOTS, JEUDI_SLOTS, AUTRE_SLOTS
+from data import Student, ParseResult, SLOTS, SAME_DAY_PAIRS, VALID_TP_PAIRS, SPE_4_SLOTS, LUNDI_SLOTS, JEUDI_SLOTS, AUTRE_SLOTS
 from solver import (
     SolverConfig,
     GroupResult,
@@ -79,8 +79,8 @@ def test_simple_no_conflict():
     config = SolverConfig(
         nb_groups={"Maths": 1, "SES": 1},
         slot_availability={
-            "Maths": [True, False, True, True, True, True, True, True, True],
-            "SES": [True, False, True, True, True, True, True, True, True],
+            "Maths": [True, False, True, True, True, True, True, True, True, True],
+            "SES": [True, False, True, True, True, True, True, True, True, True],
         },
         constraint_maths_common_slot=False,
         constraint_hlp_philo_days=False,
@@ -183,19 +183,19 @@ def test_real_data_maths_common_slot():
 
 def test_no_double_slot_same_day():
     """Aucun groupe (hors SPC/SVT) ne doit avoir 2 créneaux le même jour.
-    SPC/SVT ont exactement 1 paire TP (même jour autorisé)."""
+    SPC/SVT ont exactement 1 paire TP valide (VALID_TP_PAIRS)."""
     from data import parse_xlsx
     pr = parse_xlsx(XLSX_PATH)
     config = build_default_config(pr)
     result = solve(pr, config)
     for g in result.groups:
         if g.specialite in SPE_4_SLOTS:
-            # Doit avoir exactement 1 paire de même jour
+            # Doit avoir exactement 1 paire TP valide (sans chevauchement)
             pairs_found = sum(
-                1 for c_a, c_b in SAME_DAY_PAIRS
+                1 for c_a, c_b in VALID_TP_PAIRS
                 if c_a in g.slots and c_b in g.slots
             )
-            assert pairs_found == 1, f"{g.label} : {pairs_found} paire(s) TP (attendu exactement 1)"
+            assert pairs_found == 1, f"{g.label} : {pairs_found} paire(s) TP valide(s) (attendu exactement 1)"
         else:
             for c_a, c_b in SAME_DAY_PAIRS:
                 assert not (c_a in g.slots and c_b in g.slots), (
@@ -287,23 +287,26 @@ def test_real_data_subgroups_created():
 
 
 def test_spc_svt_has_tp_pair():
-    """Chaque groupe SPC/SVT a exactement 1 paire TP identifiée (tp_pair)."""
+    """Chaque groupe SPC/SVT a exactement 1 paire TP identifiée (tp_pair) parmi VALID_TP_PAIRS."""
     from data import parse_xlsx
     pr = parse_xlsx(XLSX_PATH)
     config = build_default_config(pr)
     result = solve(pr, config)
+    valid_tp_sets = {frozenset(p) for p in VALID_TP_PAIRS}
     for g in result.groups:
         if g.specialite in SPE_4_SLOTS:
             assert g.tp_pair is not None, f"{g.label} : tp_pair manquant"
             c_a, c_b = g.tp_pair
             assert c_a in g.slots and c_b in g.slots, f"{g.label} : tp_pair {g.tp_pair} pas dans les slots {g.slots}"
+            assert frozenset((c_a, c_b)) in valid_tp_sets, f"{g.label} : tp_pair {g.tp_pair} n'est pas une paire valide"
 
 
 def test_determinism():
-    """Deux runs avec les mêmes settings donnent exactement les mêmes slots."""
+    """Deux runs en mode déterministe donnent exactement les mêmes slots."""
     from data import parse_xlsx
     pr = parse_xlsx(XLSX_PATH)
     config = build_default_config(pr)
+    config.deterministic_mode = True
     r1 = solve(pr, config)
     r2 = solve(pr, config)
     assert r1.status == r2.status
