@@ -107,6 +107,7 @@ def test_real_data_feasible():
     from data import parse_xlsx
     pr = parse_xlsx(XLSX_PATH)
     config = build_default_config(pr)
+    config.timeout_seconds = 30
     result = solve(pr, config)
     assert result.status in ("OPTIMAL", "FEASIBLE"), f"Status: {result.status}, hints: {result.infeasibility_hints}"
 
@@ -115,6 +116,7 @@ def test_real_data_no_conflicts():
     from data import parse_xlsx
     pr = parse_xlsx(XLSX_PATH)
     config = build_default_config(pr)
+    config.timeout_seconds = 30
     result = solve(pr, config)
     assert _count_conflicts(result.groups) == 0
 
@@ -123,6 +125,7 @@ def test_real_data_group_sizes():
     from data import parse_xlsx
     pr = parse_xlsx(XLSX_PATH)
     config = build_default_config(pr)
+    config.timeout_seconds = 30
     result = solve(pr, config)
     for g in result.groups:
         assert g.effectif <= 38, f"{g.label} a {g.effectif} élèves (> 38)"
@@ -133,6 +136,7 @@ def test_real_data_all_students_placed():
     from data import parse_xlsx
     pr = parse_xlsx(XLSX_PATH)
     config = build_default_config(pr)
+    config.timeout_seconds = 30
     result = solve(pr, config)
     # Chaque élève doit être dans exactement un groupe par spécialité
     placed: dict[str, set[str]] = {}
@@ -151,6 +155,7 @@ def test_real_data_hlp_on_allowed_days():
     from data import parse_xlsx
     pr = parse_xlsx(XLSX_PATH)
     config = build_default_config(pr)
+    config.timeout_seconds = 30
     result = solve(pr, config)
     for g in result.groups:
         if g.specialite == "HLP":
@@ -167,6 +172,7 @@ def test_real_data_maths_common_slot():
     from data import parse_xlsx
     pr = parse_xlsx(XLSX_PATH)
     config = build_default_config(pr)
+    config.timeout_seconds = 30
     config.constraint_maths_common_slot = True
     result = solve(pr, config)
     maths_groups = [g for g in result.groups if g.specialite == "Maths"]
@@ -183,19 +189,24 @@ def test_real_data_maths_common_slot():
 
 def test_no_double_slot_same_day():
     """Aucun groupe (hors SPC/SVT) ne doit avoir 2 créneaux le même jour.
-    SPC/SVT ont exactement 1 paire TP valide (VALID_TP_PAIRS)."""
+    SPC/SVT ont 1 ou 2 paires TP valides (VALID_TP_PAIRS)."""
     from data import parse_xlsx
     pr = parse_xlsx(XLSX_PATH)
     config = build_default_config(pr)
+    config.timeout_seconds = 30
     result = solve(pr, config)
     for g in result.groups:
         if g.specialite in SPE_4_SLOTS:
-            # Doit avoir exactement 1 paire TP valide (sans chevauchement)
-            pairs_found = sum(
-                1 for c_a, c_b in VALID_TP_PAIRS
-                if c_a in g.slots and c_b in g.slots
-            )
-            assert pairs_found == 1, f"{g.label} : {pairs_found} paire(s) TP valide(s) (attendu exactement 1)"
+            # Doit avoir 1 ou 2 paires TP valides (sans chevauchement)
+            assert 1 <= len(g.tp_pairs) <= 2, f"{g.label} : {len(g.tp_pairs)} paire(s) TP (attendu 1 ou 2)"
+            valid_sets = {frozenset(p) for p in VALID_TP_PAIRS}
+            for c_a, c_b in g.tp_pairs:
+                assert frozenset((c_a, c_b)) in valid_sets, f"{g.label} : paire {(c_a, c_b)} invalide"
+            # Cours slots : 1 max par jour
+            for c_a, c_b in SAME_DAY_PAIRS:
+                assert not (c_a in g.cours_slots and c_b in g.cours_slots), (
+                    f"{g.label} a 2 cours même jour ({c_a}, {c_b})"
+                )
         else:
             for c_a, c_b in SAME_DAY_PAIRS:
                 assert not (c_a in g.slots and c_b in g.slots), (
@@ -212,6 +223,7 @@ def test_min_group_size():
     from data import parse_xlsx
     pr = parse_xlsx(XLSX_PATH)
     config = build_default_config(pr)
+    config.timeout_seconds = 30
     result = solve(pr, config)
     spe_students: dict[str, int] = {}
     spe_groups: dict[str, list[int]] = {}
@@ -232,7 +244,7 @@ def test_min_group_size():
 # ---------------------------------------------------------------------------
 
 def test_split_lab_groups_creates_subgroups():
-    """split_lab_groups() crée les sous-groupes A/B pour SPC et SVT."""
+    """split_lab_groups() (fallback) crée les sous-groupes A/B alphabétiques."""
     students_a = [
         Student(nom=f"Z{i}", prenom="T", classe_origine="", specialites=["SPC", "SVT"],
                 options=[], niveau="Terminale")
@@ -244,12 +256,11 @@ def test_split_lab_groups_creates_subgroups():
     assert "A" in g.subgroups and "B" in g.subgroups
     total = len(g.subgroups["A"]) + len(g.subgroups["B"])
     assert total == 10
-    # A >= B (ceil)
     assert len(g.subgroups["A"]) >= len(g.subgroups["B"])
 
 
 def test_split_lab_groups_alphabetic():
-    """Le split est alphabétique par nom."""
+    """Le split de secours est alphabétique par nom (quand solveur n'a rien rempli)."""
     students_a = [
         Student(nom=name, prenom="T", classe_origine="", specialites=["SVT", "SES"],
                 options=[], niveau="Terminale")
@@ -257,8 +268,8 @@ def test_split_lab_groups_alphabetic():
     ]
     g = GroupResult(specialite="SVT", groupe_id=0, students=students_a, slots=[0, 2, 5, 7])
     split_lab_groups([g])
-    assert g.subgroups["A"][0].nom == "Adam"   # 1er alphabétique
-    assert g.subgroups["B"][-1].nom == "Martin"  # dernier alphabétique
+    assert g.subgroups["A"][0].nom == "Adam"
+    assert g.subgroups["B"][-1].nom == "Martin"
 
 
 def test_split_lab_groups_no_subgroups_for_others():
@@ -278,6 +289,7 @@ def test_real_data_subgroups_created():
     from data import parse_xlsx
     pr = parse_xlsx(XLSX_PATH)
     config = build_default_config(pr)
+    config.timeout_seconds = 30
     result = solve(pr, config)
     for g in result.groups:
         if g.specialite in SPE_4_SLOTS:
@@ -286,19 +298,54 @@ def test_real_data_subgroups_created():
             assert len(g.subgroups.get("B", [])) > 0
 
 
-def test_spc_svt_has_tp_pair():
-    """Chaque groupe SPC/SVT a exactement 1 paire TP identifiée (tp_pair) parmi VALID_TP_PAIRS."""
+def test_spc_svt_has_tp_pairs():
+    """Chaque groupe SPC/SVT a 1 ou 2 paires TP identifiées (tp_pairs) parmi VALID_TP_PAIRS."""
     from data import parse_xlsx
     pr = parse_xlsx(XLSX_PATH)
     config = build_default_config(pr)
+    config.timeout_seconds = 30
     result = solve(pr, config)
     valid_tp_sets = {frozenset(p) for p in VALID_TP_PAIRS}
     for g in result.groups:
         if g.specialite in SPE_4_SLOTS:
-            assert g.tp_pair is not None, f"{g.label} : tp_pair manquant"
-            c_a, c_b = g.tp_pair
-            assert c_a in g.slots and c_b in g.slots, f"{g.label} : tp_pair {g.tp_pair} pas dans les slots {g.slots}"
-            assert frozenset((c_a, c_b)) in valid_tp_sets, f"{g.label} : tp_pair {g.tp_pair} n'est pas une paire valide"
+            assert 1 <= len(g.tp_pairs) <= 2, f"{g.label} : {len(g.tp_pairs)} paires (attendu 1 ou 2)"
+            for c_a, c_b in g.tp_pairs:
+                assert c_a in g.slots and c_b in g.slots, f"{g.label} : paire {(c_a, c_b)} hors slots {g.slots}"
+                assert frozenset((c_a, c_b)) in valid_tp_sets, f"{g.label} : paire {(c_a, c_b)} invalide"
+            # tp_assignments cohérent
+            assert len(g.tp_assignments) == len(g.tp_pairs)
+            for (sa, sb), pair in zip(g.tp_assignments, g.tp_pairs):
+                assert {sa, sb} == set(pair), f"{g.label} : assignment {(sa, sb)} ne matche pas paire {pair}"
+
+
+def test_spc_svt_subgroups_from_solver():
+    """Les sous-groupes A/B sont remplis par le solveur (pas par split_lab_groups)."""
+    from data import parse_xlsx
+    pr = parse_xlsx(XLSX_PATH)
+    config = build_default_config(pr)
+    config.timeout_seconds = 30
+    result = solve(pr, config)
+    for g in result.groups:
+        if g.specialite in SPE_4_SLOTS:
+            assert g.subgroups is not None
+            n_a = len(g.subgroups.get("A", []))
+            n_b = len(g.subgroups.get("B", []))
+            assert abs(n_a - n_b) <= 1, f"{g.label} : |A|={n_a} |B|={n_b} déséquilibré"
+            assert n_a + n_b == g.effectif
+            assert len(g.cours_slots) == 4 - len(g.tp_pairs)
+
+
+def test_permanences_slots_metric():
+    """La métrique n_permanences_slots compte la somme des créneaux-permanence."""
+    from data import parse_xlsx
+    pr = parse_xlsx(XLSX_PATH)
+    config = build_default_config(pr)
+    config.timeout_seconds = 30
+    result = solve(pr, config)
+    assert "n_permanences_slots" in result.stats
+    assert "n_permanences_students" in result.stats
+    # somme des créneaux ≥ nb élèves concernés
+    assert result.stats["n_permanences_slots"] >= result.stats["n_permanences_students"]
 
 
 def test_determinism():
@@ -306,6 +353,7 @@ def test_determinism():
     from data import parse_xlsx
     pr = parse_xlsx(XLSX_PATH)
     config = build_default_config(pr)
+    config.timeout_seconds = 15
     config.deterministic_mode = True
     r1 = solve(pr, config)
     r2 = solve(pr, config)

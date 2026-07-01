@@ -342,12 +342,13 @@ def step_config() -> None:
 
     timeout = st.slider(
         "Timeout solveur (secondes)",
-        10, 300, existing_config.timeout_seconds, step=10,
+        10, 900, existing_config.timeout_seconds, step=30,
         help=(
-            "Durée maximale allouée au solveur pour trouver la solution optimale. "
-            "Si ce délai est dépassé, le solveur retourne la meilleure solution trouvée "
-            "jusqu'à cet instant (statut FEASIBLE au lieu de OPTIMAL). "
-            "Augmenter si les groupes semblent déséquilibrés ou si le statut reste FEASIBLE."
+            "Durée MAXIMALE allouée au solveur. Il s'arrête AUTOMATIQUEMENT plus tôt "
+            "s'il prouve avoir exploré toutes les possibilités et trouvé l'optimum "
+            "(statut OPTIMAL). Sinon, à l'expiration du timeout, il retourne la meilleure "
+            "solution trouvée jusque-là (statut FEASIBLE — potentiellement améliorable "
+            "avec un timeout plus long). Max 900 s = 15 min."
         ),
     )
 
@@ -409,9 +410,17 @@ def step_solve() -> None:
     # Statut
     status = solver_result.status
     if status == "OPTIMAL":
-        st.success("✅ Solution optimale trouvée !")
+        st.success(
+            "✅ Solution OPTIMALE prouvée — le solveur a exploré toutes les "
+            "possibilités et garantit qu'aucune meilleure solution n'existe. "
+            "Inutile de relancer avec un timeout plus long."
+        )
     elif status == "FEASIBLE":
-        st.warning("⚠️ Solution trouvée (non optimale — timeout atteint).")
+        st.warning(
+            "⚠️ Solution FEASIBLE — trouvée avant expiration du timeout, mais "
+            "le solveur n'a pas pu prouver qu'elle est optimale. "
+            "Augmenter le timeout en étape 2 pourrait donner une meilleure solution."
+        )
     elif status == "INFEASIBLE":
         st.error("❌ Aucune solution possible (INFEASIBLE).")
         if solver_result.infeasibility_hints:
@@ -452,13 +461,14 @@ def step_solve() -> None:
     col2.metric("Conflits", stats.get("n_conflicts", 0), delta_color="inverse")
     col3.metric(
         "Permanences",
-        stats.get("n_permanences", 0),
+        stats.get("n_permanences_slots", stats.get("n_permanences", 0)),
         delta_color="inverse",
         help=(
-            "Nombre d'élèves ayant au moins un demi-journée isolée : "
-            "ils ont cours sur un seul des deux créneaux d'une même matinée "
-            "(ex. Mardi 8h mais pas Mardi 10h), ce qui génère une permanence. "
-            "Le solveur cherche à minimiser ce nombre."
+            "Somme des créneaux-permanence sur tous les élèves. "
+            "Un élève avec cours Mardi 8h mais pas Mardi 10h compte 1. "
+            "S'il a aussi une permanence Jeudi, ça compte 2. "
+            "Le solveur cherche à minimiser ce total. "
+            f"(Élèves concernés : {stats.get('n_permanences_students', stats.get('n_permanences', 0))})"
         ),
     )
     col4.metric("Temps (s)", stats.get("wall_time", ""))
@@ -712,12 +722,22 @@ def step_export() -> None:
                 groupe_id=g.groupe_id,
                 students=members,
                 slots=g.slots,
+                subgroups=g.subgroups,
+                tp_pairs=g.tp_pairs,
+                tp_assignments=g.tp_assignments,
+                cours_slots=g.cours_slots,
             ))
         # Recalcule les stats
         n_conflicts = _solver._count_conflicts(new_groups)
-        n_perm = _solver._count_permanences(new_groups)
+        n_perm_slots = _solver._count_permanences_slots(new_groups)
+        n_perm_students = _solver._count_permanences(new_groups)
         new_stats = dict(solver_result.stats)
-        new_stats.update({"n_conflicts": n_conflicts, "n_permanences": n_perm})
+        new_stats.update({
+            "n_conflicts": n_conflicts,
+            "n_permanences": n_perm_students,
+            "n_permanences_students": n_perm_students,
+            "n_permanences_slots": n_perm_slots,
+        })
         final_result = _solver.SolverResult(
             status=solver_result.status,
             groups=new_groups,
@@ -731,12 +751,12 @@ def step_export() -> None:
     col1.metric("Conflits", stats.get("n_conflicts", 0))
     col2.metric(
         "Permanences",
-        stats.get("n_permanences", 0),
+        stats.get("n_permanences_slots", stats.get("n_permanences", 0)),
         help=(
-            "Nombre d'élèves ayant au moins un demi-journée isolée : "
-            "ils ont cours sur un seul des deux créneaux d'une même matinée "
-            "(ex. Mardi 8h mais pas Mardi 10h), ce qui génère une permanence. "
-            "Le solveur cherche à minimiser ce nombre."
+            "Somme des créneaux-permanence sur tous les élèves. "
+            "Un élève avec cours Mardi 8h mais pas Mardi 10h compte 1. "
+            "S'il a aussi une permanence Jeudi, ça compte 2. "
+            f"(Élèves concernés : {stats.get('n_permanences_students', stats.get('n_permanences', 0))})"
         ),
     )
     col3.metric("Statut", final_result.status)

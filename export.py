@@ -16,7 +16,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 from data import SLOTS, SPE_4_SLOTS, ParseResult
-from solver import GroupResult, SolverResult
+from solver import GroupResult, SolverResult, student_visible_slots
 
 # Couleurs par spécialité
 SPE_COLORS: dict[str, str] = {
@@ -73,24 +73,26 @@ def _sheet_planning_groupes(wb: openpyxl.Workbook, result: SolverResult) -> None
     groups = sorted(result.groups, key=lambda g: (g.specialite, g.groupe_id))
 
     # col_entries : (header_label, spe, slot_idx → cell_label)
-    # Pour SPC/SVT : colonne par sous-groupe, avec label "cours" ou "TP"
+    # Pour SPC/SVT : colonne par sous-groupe, avec label "cours" ou "TP" par jour TP
     col_entries: list[tuple[str, str, dict[int, str]]] = []
     for g in groups:
-        if g.specialite in SPE_4_SLOTS and g.subgroups and g.tp_pair:
-            tp_a, tp_b = g.tp_pair
+        if g.specialite in SPE_4_SLOTS and g.subgroups and (g.tp_assignments or g.tp_pairs):
+            # tp_assignments : [(slot_A, slot_B), ...] par jour TP
+            slots_A = {slot_A for (slot_A, _) in g.tp_assignments}
+            slots_B = {slot_B for (_, slot_B) in g.tp_assignments}
             for letter in ("A", "B"):
                 slot_labels: dict[int, str] = {}
                 for c in g.slots:
-                    if c == tp_a:
-                        slot_labels[c] = f"{g.label}{'A' if letter == 'A' else 'B'} TP"
-                    elif c == tp_b:
-                        # Seul le sous-groupe correspondant au slot c_b a cours ici
-                        slot_labels[c] = f"{g.label}B TP" if letter == "B" else ""
-                    else:
+                    if c in g.cours_slots:
                         slot_labels[c] = f"{g.label} cours"
+                    elif letter == "A" and c in slots_A:
+                        slot_labels[c] = f"{g.label}A TP"
+                    elif letter == "B" and c in slots_B:
+                        slot_labels[c] = f"{g.label}B TP"
+                    # slots TP de l'autre sous-groupe → vide
                 col_entries.append((f"{g.label}{letter}", g.specialite, slot_labels))
         elif g.specialite in SPE_4_SLOTS and g.subgroups:
-            # tp_pair pas détectée (rare) : fallback sans distinction
+            # Pas de tp identifié : fallback
             for letter in ("A", "B"):
                 col_entries.append((f"{g.label}{letter}", g.specialite, {c: g.label for c in g.slots}))
         else:
@@ -152,7 +154,6 @@ def _sheet_planning_eleves(
         ws.column_dimensions[get_column_letter(c)].width = 14
 
     student_groups = result.get_student_groups()
-    student_slots = result.get_student_slots()
 
     # Map nom_prenom → sous-groupe letter (A ou B) pour SPC/SVT
     student_subgroup: dict[str, str] = {}
@@ -168,7 +169,11 @@ def _sheet_planning_eleves(
     for name in sorted(student_map.keys()):
         st_obj = student_map[name]
         grps = student_groups.get(name, [])
-        slots = student_slots.get(name, [])
+        # Slots vraiment vus par cet élève (respectant A/B pour SPC/SVT)
+        visible: set[int] = set()
+        for g in grps:
+            visible.update(student_visible_slots(st_obj, g))
+        slots = sorted(visible)
 
         ws.cell(row=row_idx, column=1, value=st_obj.nom)
         ws.cell(row=row_idx, column=2, value=st_obj.prenom)
@@ -181,18 +186,22 @@ def _sheet_planning_eleves(
             col = 6 + slot_idx
             spe_label = ""
             for g in grps:
-                if slot_idx in g.slots:
-                    if g.specialite in SPE_4_SLOTS and g.tp_pair:
-                        tp_a, tp_b = g.tp_pair
-                        if slot_idx == tp_a:
-                            spe_label = f"{g.label}A TP" if letter == "A" else ""
-                        elif slot_idx == tp_b:
-                            spe_label = f"{g.label}B TP" if letter == "B" else ""
-                        else:
-                            spe_label = f"{g.label} cours"
+                if slot_idx not in student_visible_slots(st_obj, g):
+                    continue
+                if g.specialite in SPE_4_SLOTS and g.tp_assignments:
+                    slots_A = {a for (a, _) in g.tp_assignments}
+                    slots_B = {b for (_, b) in g.tp_assignments}
+                    if slot_idx in g.cours_slots:
+                        spe_label = f"{g.label} cours"
+                    elif slot_idx in slots_A:
+                        spe_label = f"{g.label}A TP"
+                    elif slot_idx in slots_B:
+                        spe_label = f"{g.label}B TP"
                     else:
                         spe_label = g.label
-                    break
+                else:
+                    spe_label = g.label
+                break
             if not spe_label:
                 continue
             cell = ws.cell(row=row_idx, column=col, value=spe_label)
@@ -228,8 +237,11 @@ def _sheet_effectifs(
     ws.cell(row=row, column=1, value="Conflits de créneaux").font = _bold()
     ws.cell(row=row, column=2, value=result.stats.get("n_conflicts", ""))
     row += 1
-    ws.cell(row=row, column=1, value="Élèves avec permanence").font = _bold()
-    ws.cell(row=row, column=2, value=result.stats.get("n_permanences", ""))
+    ws.cell(row=row, column=1, value="Créneaux-permanence (total)").font = _bold()
+    ws.cell(row=row, column=2, value=result.stats.get("n_permanences_slots", ""))
+    row += 1
+    ws.cell(row=row, column=1, value="Élèves avec ≥1 permanence").font = _bold()
+    ws.cell(row=row, column=2, value=result.stats.get("n_permanences_students", ""))
     row += 1
     ws.cell(row=row, column=1, value="Statut solveur").font = _bold()
     ws.cell(row=row, column=2, value=result.status)

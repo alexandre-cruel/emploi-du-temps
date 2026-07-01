@@ -29,6 +29,21 @@ from data import (
     Student,
 )
 
+
+def student_visible_slots(student: Student, group: "GroupResult") -> list[int]:
+    """Retourne les slots vraiment vus par cet élève dans ce groupe.
+    Pour SPC/SVT : cours communs + slot TP de son sous-groupe (A ou B) uniquement.
+    Pour les autres : tous les slots du groupe.
+    """
+    if group.specialite not in SPE_4_SLOTS or not group.subgroups:
+        return list(group.slots)
+    is_a = any(s.nom == student.nom and s.prenom == student.prenom
+               for s in group.subgroups.get("A", []))
+    visible = list(group.cours_slots)
+    for (slot_a, slot_b) in group.tp_assignments:
+        visible.append(slot_a if is_a else slot_b)
+    return visible
+
 N_SLOTS = len(SLOTS)
 
 
@@ -42,7 +57,7 @@ class SolverConfig:
     constraint_maths_common_slot: bool = True
     maths_common_slot_idx: int = SLOT_MATCO  # Cr4 Mercredi — disponible pour Maths
 
-    timeout_seconds: int = 60
+    timeout_seconds: int = 300
     niveau: str = "Terminale"
     deterministic_mode: bool = False  # True = 1 worker (reproductible), False = 4 workers (rapide)
 
@@ -54,7 +69,9 @@ class GroupResult:
     students: list[Student]
     slots: list[int]
     subgroups: dict[str, list[Student]] | None = None  # {"A": [...], "B": [...]} pour SPC/SVT
-    tp_pair: tuple[int, int] | None = None  # (c_a, c_b) : paire de créneaux TP pour SPC/SVT
+    tp_pairs: list[tuple[int, int]] = field(default_factory=list)  # paires TP (same-day) — 1 ou 2 pour SPC/SVT
+    tp_assignments: list[tuple[int, int]] = field(default_factory=list)  # [(slot_A, slot_B), ...] par jour TP
+    cours_slots: list[int] = field(default_factory=list)  # slots de cours (groupe entier) pour SPC/SVT
 
     @property
     def label(self) -> str:
@@ -63,6 +80,11 @@ class GroupResult:
     @property
     def effectif(self) -> int:
         return len(self.students)
+
+    @property
+    def tp_pair(self) -> tuple[int, int] | None:
+        """Compat rétro : renvoie la première paire TP (ou None)."""
+        return self.tp_pairs[0] if self.tp_pairs else None
 
 
 @dataclass
@@ -167,9 +189,12 @@ def solve(parse_result: ParseResult, config: SolverConfig) -> SolverResult:
                 in_group[(idx, spe, g)] = b
 
     # -----------------------------------------------------------------------
-    # Nombre exact de créneaux par groupe
+    # Nombre exact de créneaux par groupe (non-SPC/SVT)
+    # SPC/SVT : occupent 4+n_tp_days slots (5 ou 6), géré séparément plus bas
     # -----------------------------------------------------------------------
     for spe in specialites:
+        if spe in SPE_4_SLOTS:
+            continue
         G = config.nb_groups.get(spe, 1)
         n_req = nb_slots_required(spe)
         for g in range(G):
@@ -189,8 +214,209 @@ def solve(parse_result: ParseResult, config: SolverConfig) -> SolverResult:
                 model.add(group_sum >= min_size)
 
     # -----------------------------------------------------------------------
-    # Anti-conflit : aucun créneau partagé entre les spés d'un même élève
+    # SPC/SVT : sous-groupes A/B intégrés + 1 ou 2 paires TP
     # -----------------------------------------------------------------------
+    # Décomposition par (spe, g, c) : chaque slot est soit cours (groupe entier),
+    # soit TP_A (sous-groupe A uniquement), soit TP_B, soit inutilisé.
+    # Mode 1 : 3 cours + 1 paire TP  → 5 slots occupés au total, 4 vus/élève
+    # Mode 2 : 2 cours + 2 paires TP → 6 slots occupés au total, 4 vus/élève
+    cours_var: dict[tuple[str, int, int], cp_model.BoolVar] = {}
+    tp_a_slot: dict[tuple[str, int, int], cp_model.BoolVar] = {}
+    tp_b_slot: dict[tuple[str, int, int], cp_model.BoolVar] = {}
+    tp_day: dict[tuple[str, int, int], cp_model.BoolVar] = {}
+    tp_swap: dict[tuple[str, int, int], cp_model.BoolVar] = {}
+    sub_var: dict[tuple[int, str], cp_model.BoolVar] = {}  # 0 = A, 1 = B
+
+    _valid_tp_sets = {frozenset(p) for p in VALID_TP_PAIRS}
+    _pairs_containing_slot: dict[int, list[int]] = {c: [] for c in range(N_SLOTS)}
+    for pi, (c_a, c_b) in enumerate(VALID_TP_PAIRS):
+        _pairs_containing_slot[c_a].append(pi)
+        _pairs_containing_slot[c_b].append(pi)
+
+    for spe in SPE_4_SLOTS:
+        if spe not in specialites:
+            continue
+        G = config.nb_groups.get(spe, 1)
+        avail = config.slot_availability.get(spe, [True] * N_SLOTS)
+        for g in range(G):
+            # Cours vars
+            for c in range(N_SLOTS):
+                cv = model.new_bool_var(f"cours_{spe}_{g}_{c}")
+                cours_var[(spe, g, c)] = cv
+                if not avail[c]:
+                    model.add(cv == 0)
+                # HLP-like: pas de 2 cours same-day
+                # (fait plus loin globalement)
+
+            # TP pair vars (par paire valide)
+            for pi, (c_a, c_b) in enumerate(VALID_TP_PAIRS):
+                td = model.new_bool_var(f"tpday_{spe}_{g}_{pi}")
+                sw = model.new_bool_var(f"tpswap_{spe}_{g}_{pi}")
+                tp_day[(spe, g, pi)] = td
+                tp_swap[(spe, g, pi)] = sw
+                if not avail[c_a] or not avail[c_b]:
+                    model.add(td == 0)
+
+            # tp_a_slot / tp_b_slot dérivés
+            for c in range(N_SLOTS):
+                ta = model.new_bool_var(f"tpa_{spe}_{g}_{c}")
+                tb = model.new_bool_var(f"tpb_{spe}_{g}_{c}")
+                tp_a_slot[(spe, g, c)] = ta
+                tp_b_slot[(spe, g, c)] = tb
+                if not avail[c]:
+                    model.add(ta == 0)
+                    model.add(tb == 0)
+
+            # Lier tp_a_slot / tp_b_slot à tp_day et tp_swap
+            # Pour chaque paire (c_a, c_b) : si td=1 ET swap=0 → A sur c_a, B sur c_b
+            #                                si td=1 ET swap=1 → A sur c_b, B sur c_a
+            # a_at_ca[pi] = td[pi] AND NOT swap[pi]
+            # a_at_cb[pi] = td[pi] AND swap[pi]
+            a_at_ca: dict[int, cp_model.BoolVar] = {}
+            a_at_cb: dict[int, cp_model.BoolVar] = {}
+            for pi, (c_a, c_b) in enumerate(VALID_TP_PAIRS):
+                td = tp_day[(spe, g, pi)]
+                sw = tp_swap[(spe, g, pi)]
+                aa = model.new_bool_var(f"a_at_ca_{spe}_{g}_{pi}")
+                ab = model.new_bool_var(f"a_at_cb_{spe}_{g}_{pi}")
+                # aa = td AND NOT sw
+                model.add_bool_and([td, sw.negated()]).only_enforce_if(aa)
+                model.add_bool_or([td.negated(), sw]).only_enforce_if(aa.negated())
+                # ab = td AND sw
+                model.add_bool_and([td, sw]).only_enforce_if(ab)
+                model.add_bool_or([td.negated(), sw.negated()]).only_enforce_if(ab.negated())
+                a_at_ca[pi] = aa
+                a_at_cb[pi] = ab
+
+            # tp_a_slot[c] = sum over pairs p starting at c of a_at_ca[p]
+            #              + sum over pairs p ending at c of a_at_cb[p]
+            # tp_b_slot[c] = sum a_at_cb (starting) + sum a_at_ca (ending)
+            for c in range(N_SLOTS):
+                contrib_a = []
+                contrib_b = []
+                for pi, (c_a, c_b) in enumerate(VALID_TP_PAIRS):
+                    if c == c_a:
+                        contrib_a.append(a_at_ca[pi])
+                        contrib_b.append(a_at_cb[pi])
+                    elif c == c_b:
+                        contrib_a.append(a_at_cb[pi])
+                        contrib_b.append(a_at_ca[pi])
+                if contrib_a:
+                    model.add(tp_a_slot[(spe, g, c)] == sum(contrib_a))
+                else:
+                    model.add(tp_a_slot[(spe, g, c)] == 0)
+                if contrib_b:
+                    model.add(tp_b_slot[(spe, g, c)] == sum(contrib_b))
+                else:
+                    model.add(tp_b_slot[(spe, g, c)] == 0)
+
+            # Exclusivité par slot : au plus un rôle (cours, tp_a, tp_b)
+            for c in range(N_SLOTS):
+                model.add(
+                    cours_var[(spe, g, c)] + tp_a_slot[(spe, g, c)] + tp_b_slot[(spe, g, c)] <= 1
+                )
+
+            # slot_var (déjà défini plus haut) = cours + tp_a + tp_b
+            for c in range(N_SLOTS):
+                model.add(
+                    slot_var[(spe, g, c)]
+                    == cours_var[(spe, g, c)] + tp_a_slot[(spe, g, c)] + tp_b_slot[(spe, g, c)]
+                )
+
+            # 1 ou 2 jours TP
+            n_tp_days = model.new_int_var(1, 2, f"n_tp_days_{spe}_{g}")
+            model.add(n_tp_days == sum(tp_day[(spe, g, pi)] for pi in range(len(VALID_TP_PAIRS))))
+            # Nb cours = 4 - n_tp_days (chaque élève voit 4 slots)
+            model.add(sum(cours_var[(spe, g, c)] for c in range(N_SLOTS)) == 4 - n_tp_days)
+            # Redéfinir la contrainte "nb slots totaux vus par le groupe" :
+            # groupe occupe (n_cours + 2*n_tp_days) slots = (4-n_tp_days) + 2*n_tp_days = 4 + n_tp_days
+            # Déjà encodé via slot_var, mais on avait défini plus haut slot_var == 4 (n_slots_required).
+            # → il faut redéfinir cette contrainte pour SPC/SVT (elle sera supprimée / réécrite)
+
+            # Cours : pas 2 sur le même jour
+            for c_a, c_b in SAME_DAY_PAIRS:
+                model.add(cours_var[(spe, g, c_a)] + cours_var[(spe, g, c_b)] <= 1)
+
+            # Au plus un pair-TP par slot (empêche slot 1 d'être TP via (9,1) ET (0,1) en même temps)
+            for c in range(N_SLOTS):
+                pairs = _pairs_containing_slot[c]
+                if len(pairs) > 1:
+                    model.add(sum(tp_day[(spe, g, pi)] for pi in pairs) <= 1)
+
+    # -----------------------------------------------------------------------
+    # Sous-groupe A/B par élève (uniquement SPC/SVT)
+    # -----------------------------------------------------------------------
+    for spe in SPE_4_SLOTS:
+        if spe not in specialites:
+            continue
+        for (idx, _) in spe_to_students[spe]:
+            sub_var[(idx, spe)] = model.new_bool_var(f"sub_{idx}_{spe}")
+
+    # Équilibrage A/B par groupe (|A| == |B| ou ±1)
+    for spe in SPE_4_SLOTS:
+        if spe not in specialites:
+            continue
+        G = config.nb_groups.get(spe, 1)
+        for g in range(G):
+            # sum over students of (in_group AND sub==B) is size of B
+            in_group_b_vars: list[cp_model.BoolVar] = []
+            in_group_a_vars: list[cp_model.BoolVar] = []
+            for (idx, _) in spe_to_students[spe]:
+                ig = in_group[(idx, spe, g)]
+                sub = sub_var[(idx, spe)]
+                # inB = ig AND sub
+                inB = model.new_bool_var(f"inB_{idx}_{spe}_{g}")
+                model.add_bool_and([ig, sub]).only_enforce_if(inB)
+                model.add_bool_or([ig.negated(), sub.negated()]).only_enforce_if(inB.negated())
+                # inA = ig AND NOT sub
+                inA = model.new_bool_var(f"inA_{idx}_{spe}_{g}")
+                model.add_bool_and([ig, sub.negated()]).only_enforce_if(inA)
+                model.add_bool_or([ig.negated(), sub]).only_enforce_if(inA.negated())
+                in_group_b_vars.append(inB)
+                in_group_a_vars.append(inA)
+            n_total = len(spe_to_students[spe])
+            sz_a = model.new_int_var(0, n_total, f"szA_{spe}_{g}")
+            sz_b = model.new_int_var(0, n_total, f"szB_{spe}_{g}")
+            model.add(sz_a == sum(in_group_a_vars))
+            model.add(sz_b == sum(in_group_b_vars))
+            # |A - B| <= 1
+            diff_ab = model.new_int_var(-n_total, n_total, f"diffAB_{spe}_{g}")
+            model.add(diff_ab == sz_a - sz_b)
+            model.add(diff_ab >= -1)
+            model.add(diff_ab <= 1)
+
+    # -----------------------------------------------------------------------
+    # Anti-conflit inter-spé (avec support A/B pour SPC/SVT)
+    # -----------------------------------------------------------------------
+    # visible_slot[idx, spe, g, c] : cet élève voit-il ce slot ?
+    #   - non-SPC/SVT : slot_var[spe, g, c]
+    #   - SPC/SVT : cours_var[c] OR (sub==A AND tp_a_slot[c]) OR (sub==B AND tp_b_slot[c])
+    visible: dict[tuple[int, str, int, int], cp_model.BoolVar] = {}
+
+    def get_visible(idx: int, spe: str, g: int, c: int) -> cp_model.BoolVar:
+        key = (idx, spe, g, c)
+        if key in visible:
+            return visible[key]
+        if spe not in SPE_4_SLOTS:
+            visible[key] = slot_var[(spe, g, c)]
+            return visible[key]
+        # SPC/SVT: crée un booléen dérivé
+        v = model.new_bool_var(f"vis_{idx}_{spe}_{g}_{c}")
+        visible[key] = v
+        cv = cours_var[(spe, g, c)]
+        ta = tp_a_slot[(spe, g, c)]
+        tb = tp_b_slot[(spe, g, c)]
+        sub = sub_var[(idx, spe)]
+        # v = cv OR (NOT sub AND ta) OR (sub AND tb)
+        # Décomposition par cas :
+        # Si sub = 0 (A) : v = cv OR ta
+        model.add(v == cv + ta).only_enforce_if(sub.negated())
+        # Si sub = 1 (B) : v = cv OR tb
+        model.add(v == cv + tb).only_enforce_if(sub)
+        # Note : cv, ta, tb sont mutuellement exclusifs (contrainte plus haut),
+        # donc cv+ta et cv+tb sont ∈ {0,1}.
+        return v
+
     for idx, st in enumerate(students):
         spes = [s for s in st.specialites if s in specialites]
         for i in range(len(spes)):
@@ -201,17 +427,17 @@ def solve(parse_result: ParseResult, config: SolverConfig) -> SolverResult:
                 for c in range(N_SLOTS):
                     for g1 in range(G1):
                         for g2 in range(G2):
-                            # NOT(in_g1 AND in_g2 AND slot_s1_g1_c AND slot_s2_g2_c)
+                            v1 = get_visible(idx, s1, g1, c)
+                            v2 = get_visible(idx, s2, g2, c)
                             model.add_bool_or([
                                 in_group[(idx, s1, g1)].negated(),
                                 in_group[(idx, s2, g2)].negated(),
-                                slot_var[(s1, g1, c)].negated(),
-                                slot_var[(s2, g2, c)].negated(),
+                                v1.negated(),
+                                v2.negated(),
                             ])
 
     # -----------------------------------------------------------------------
-    # Un groupe ne peut pas avoir les deux créneaux d'un même jour
-    # Exception SPC/SVT : ils ont une paire TP (même jour obligatoire) — gérée séparément
+    # Un groupe ne peut pas avoir les deux créneaux d'un même jour (non-SPC/SVT)
     # -----------------------------------------------------------------------
     for spe in specialites:
         if spe in SPE_4_SLOTS:
@@ -220,35 +446,6 @@ def solve(parse_result: ParseResult, config: SolverConfig) -> SolverResult:
         for g in range(G):
             for c_a, c_b in SAME_DAY_PAIRS:
                 model.add(slot_var[(spe, g, c_a)] + slot_var[(spe, g, c_b)] <= 1)
-
-    # -----------------------------------------------------------------------
-    # SPC/SVT : exactement 1 paire TP (même jour, sans chevauchement horaire)
-    # Les 2 autres créneaux sont des cours (groupe entier, 1 seul par jour)
-    # Utilise VALID_TP_PAIRS (sous-ensemble de SAME_DAY_PAIRS sans les paires qui se chevauchent)
-    # -----------------------------------------------------------------------
-    _valid_tp_sets = {frozenset(p) for p in VALID_TP_PAIRS}
-    for spe in SPE_4_SLOTS:
-        if spe not in specialites:
-            continue
-        G = config.nb_groups.get(spe, 1)
-        avail = config.slot_availability.get(spe, [True] * N_SLOTS)
-        for g in range(G):
-            pair_used: list[cp_model.BoolVar] = []
-            for c_a, c_b in VALID_TP_PAIRS:
-                pv = model.new_bool_var(f"tp_{spe}_{g}_{c_a}")
-                # Si pv=1 → les deux créneaux du jour sont utilisés (paire TP)
-                model.add(slot_var[(spe, g, c_a)] + slot_var[(spe, g, c_b)] == 2).only_enforce_if(pv)
-                model.add(slot_var[(spe, g, c_a)] + slot_var[(spe, g, c_b)] <= 1).only_enforce_if(pv.negated())
-                # Si l'un des deux créneaux est indisponible, la paire ne peut pas être choisie
-                if not avail[c_a] or not avail[c_b]:
-                    model.add(pv == 0)
-                pair_used.append(pv)
-            model.add(sum(pair_used) == 1)  # exactement 1 jour TP
-            # Bloquer les paires du même jour qui ne sont PAS des paires TP valides
-            # (ex: slot 0 et slot 9 se chevauchent → ne peuvent jamais être 2 cours le même jour)
-            for c_a, c_b in SAME_DAY_PAIRS:
-                if frozenset((c_a, c_b)) not in _valid_tp_sets:
-                    model.add(slot_var[(spe, g, c_a)] + slot_var[(spe, g, c_b)] <= 1)
 
     # -----------------------------------------------------------------------
     # HLP : 1 slot Lundi + 1 slot Jeudi + 1 slot autre jour (Mardi/Merc/Vend)
@@ -327,24 +524,38 @@ def solve(parse_result: ParseResult, config: SolverConfig) -> SolverResult:
                 if avail[c]:
                     obj_terms.append(slot_var[("LCE", g, c)] * 3)
 
-    # Permanences : pénalité si créneau isolé sur un jour à 2 slots
-    for spe in specialites:
-        G = config.nb_groups.get(spe, 1)
-        avail = config.slot_availability.get(spe, [True] * N_SLOTS)
-        for g in range(G):
-            for c_a, c_b in DOUBLE_SLOT_PAIRS:
-                if not avail[c_a] or not avail[c_b]:
-                    continue
-                sa, sb = slot_var[(spe, g, c_a)], slot_var[(spe, g, c_b)]
-                only_a = model.new_bool_var(f"pa_{spe}_{g}_{c_a}")
-                only_b = model.new_bool_var(f"pb_{spe}_{g}_{c_b}")
-                # only_a = sa AND NOT sb
-                model.add_bool_and([sa, sb.negated()]).only_enforce_if(only_a)
-                model.add_bool_or([sa.negated(), sb]).only_enforce_if(only_a.negated())
-                # only_b = sb AND NOT sa
-                model.add_bool_and([sb, sa.negated()]).only_enforce_if(only_b)
-                model.add_bool_or([sb.negated(), sa]).only_enforce_if(only_b.negated())
-                obj_terms.extend([only_a * 5, only_b * 5])
+    # Permanences : pénalité par élève et par paire same-day (métrique proviseur)
+    # busy_a[idx, c_a] = 1 ssi l'élève idx a cours au slot c_a (via l'une de ses spés)
+    # perm = busy_a XOR busy_b sur chaque DOUBLE_SLOT_PAIR
+    for idx, st in enumerate(students):
+        spes = [s for s in st.specialites if s in specialites]
+        if not spes:
+            continue
+        for c_a, c_b in DOUBLE_SLOT_PAIRS:
+            terms_a = []
+            terms_b = []
+            for spe in spes:
+                G = config.nb_groups.get(spe, 1)
+                for g in range(G):
+                    ig = in_group[(idx, spe, g)]
+                    va = get_visible(idx, spe, g, c_a)
+                    vb = get_visible(idx, spe, g, c_b)
+                    ca = model.new_bool_var(f"at_{idx}_{spe}_{g}_{c_a}")
+                    cb = model.new_bool_var(f"at_{idx}_{spe}_{g}_{c_b}")
+                    model.add_bool_and([ig, va]).only_enforce_if(ca)
+                    model.add_bool_or([ig.negated(), va.negated()]).only_enforce_if(ca.negated())
+                    model.add_bool_and([ig, vb]).only_enforce_if(cb)
+                    model.add_bool_or([ig.negated(), vb.negated()]).only_enforce_if(cb.negated())
+                    terms_a.append(ca)
+                    terms_b.append(cb)
+            busy_a = model.new_bool_var(f"busyA_{idx}_{c_a}")
+            busy_b = model.new_bool_var(f"busyB_{idx}_{c_b}")
+            model.add(busy_a == sum(terms_a))
+            model.add(busy_b == sum(terms_b))
+            perm = model.new_bool_var(f"perm_{idx}_{c_a}_{c_b}")
+            model.add(busy_a + busy_b == 1).only_enforce_if(perm)
+            model.add(busy_a + busy_b != 1).only_enforce_if(perm.negated())
+            obj_terms.append(perm * 5)
 
     if obj_terms:
         model.minimize(sum(obj_terms))
@@ -387,14 +598,45 @@ def solve(parse_result: ParseResult, config: SolverConfig) -> SolverResult:
                 st for (idx, st) in spe_to_students[spe]
                 if solver.value(groupe_var[(idx, spe)]) == g
             ]
-            groups.append(GroupResult(specialite=spe, groupe_id=g, students=members, slots=assigned_slots))
+            gr = GroupResult(specialite=spe, groupe_id=g, students=members, slots=assigned_slots)
+            if spe in SPE_4_SLOTS:
+                # Extraire cours_slots, tp_pairs, tp_assignments, subgroups
+                gr.cours_slots = sorted(
+                    c for c in range(N_SLOTS) if solver.value(cours_var[(spe, g, c)]) == 1
+                )
+                tp_pairs_list: list[tuple[int, int]] = []
+                tp_assign_list: list[tuple[int, int]] = []
+                for pi, (c_a, c_b) in enumerate(VALID_TP_PAIRS):
+                    if solver.value(tp_day[(spe, g, pi)]) == 1:
+                        tp_pairs_list.append((c_a, c_b))
+                        # swap=0 → A sur c_a, B sur c_b ; swap=1 → A sur c_b, B sur c_a
+                        if solver.value(tp_swap[(spe, g, pi)]) == 1:
+                            tp_assign_list.append((c_b, c_a))
+                        else:
+                            tp_assign_list.append((c_a, c_b))
+                gr.tp_pairs = tp_pairs_list
+                gr.tp_assignments = tp_assign_list
+                # Sous-groupes A/B depuis sub_var
+                a_members: list[Student] = []
+                b_members: list[Student] = []
+                for (idx, st_obj) in spe_to_students[spe]:
+                    if solver.value(groupe_var[(idx, spe)]) != g:
+                        continue
+                    if solver.value(sub_var[(idx, spe)]) == 0:
+                        a_members.append(st_obj)
+                    else:
+                        b_members.append(st_obj)
+                gr.subgroups = {"A": a_members, "B": b_members}
+            groups.append(gr)
 
-    split_lab_groups(groups)
-    n_permanences = _count_permanences(groups)
+    n_permanences_students = _count_permanences(groups)
+    n_permanences_slots = _count_permanences_slots(groups)
     stats = {
         "n_students": len(students),
         "n_conflicts": _count_conflicts(groups),
-        "n_permanences": n_permanences,
+        "n_permanences": n_permanences_students,        # rétro-compat
+        "n_permanences_students": n_permanences_students,
+        "n_permanences_slots": n_permanences_slots,     # métrique proviseur
         "objective": solver.objective_value,
         "wall_time": round(solver.wall_time, 2),
     }
@@ -402,45 +644,51 @@ def solve(parse_result: ParseResult, config: SolverConfig) -> SolverResult:
 
 
 def split_lab_groups(groups: list[GroupResult]) -> list[GroupResult]:
-    """Crée les sous-groupes A/B pour SPC et SVT (split alphabétique) et identifie la paire TP."""
+    """Fallback : crée les sous-groupes A/B (split alphabétique) pour SPC/SVT
+    quand ils ne sont pas déjà remplis par le solveur. Conservé pour compat.
+    """
     for g in groups:
-        if g.specialite in SPE_4_SLOTS:
+        if g.specialite in SPE_4_SLOTS and not g.subgroups:
             sorted_students = sorted(g.students, key=lambda s: (s.nom, s.prenom))
-            mid = (len(sorted_students) + 1) // 2  # ceil → A toujours ≥ B
+            mid = (len(sorted_students) + 1) // 2
             g.subgroups = {
                 "A": sorted_students[:mid],
                 "B": sorted_students[mid:],
             }
-            # Identifier la paire TP parmi les paires valides (sans chevauchement)
-            slots_set = set(g.slots)
-            for c_a, c_b in VALID_TP_PAIRS:
-                if c_a in slots_set and c_b in slots_set:
-                    g.tp_pair = (c_a, c_b)
-                    break
+            if not g.tp_pairs:
+                slots_set = set(g.slots)
+                for c_a, c_b in VALID_TP_PAIRS:
+                    if c_a in slots_set and c_b in slots_set:
+                        g.tp_pairs = [(c_a, c_b)]
+                        g.tp_assignments = [(c_a, c_b)]
+                        break
+                # cours_slots = slots restants
+                tp_slots = {c for pair in g.tp_pairs for c in pair}
+                g.cours_slots = sorted(c for c in g.slots if c not in tp_slots)
     return groups
 
 
 def _count_conflicts(groups: list[GroupResult]) -> int:
+    """Compte les collisions de créneaux vus par chaque élève.
+    Pour SPC/SVT : ne considère que les slots vus par le sous-groupe de l'élève.
+    """
     student_slots: dict[str, set[int]] = {}
     conflicts = 0
     for g in groups:
         for st in g.students:
             key = f"{st.nom} {st.prenom}"
             existing = student_slots.get(key, set())
-            overlap = existing & set(g.slots)
+            visible = set(student_visible_slots(st, g))
+            overlap = existing & visible
             if overlap:
                 conflicts += len(overlap)
-            student_slots[key] = existing | set(g.slots)
+            student_slots[key] = existing | visible
     return conflicts
 
 
 def _count_permanences(groups: list[GroupResult]) -> int:
-    student_slots: dict[str, set[int]] = {}
-    for g in groups:
-        for st in g.students:
-            key = f"{st.nom} {st.prenom}"
-            student_slots.setdefault(key, set()).update(g.slots)
-
+    """Nombre d'élèves ayant AU MOINS une permanence (métrique historique)."""
+    student_slots = _collect_student_slots(groups)
     count = 0
     for _, slots in student_slots.items():
         for c_a, c_b in DOUBLE_SLOT_PAIRS:
@@ -448,6 +696,31 @@ def _count_permanences(groups: list[GroupResult]) -> int:
                 count += 1
                 break
     return count
+
+
+def _count_permanences_slots(groups: list[GroupResult]) -> int:
+    """Somme des créneaux-permanence sur tous les élèves (métrique proviseur).
+    Un élève avec Mardi 8h sans Mardi 10h compte 1. S'il a aussi une perm Jeudi, compte 2.
+    """
+    student_slots = _collect_student_slots(groups)
+    count = 0
+    for _, slots in student_slots.items():
+        for c_a, c_b in DOUBLE_SLOT_PAIRS:
+            if (c_a in slots) != (c_b in slots):
+                count += 1
+    return count
+
+
+def _collect_student_slots(groups: list[GroupResult]) -> dict[str, set[int]]:
+    """Retourne les slots vus par chaque élève (agrège toutes ses spés).
+    Pour SPC/SVT : slots vus dépendent du sous-groupe A/B.
+    """
+    student_slots: dict[str, set[int]] = {}
+    for g in groups:
+        for st in g.students:
+            key = f"{st.nom} {st.prenom}"
+            student_slots.setdefault(key, set()).update(student_visible_slots(st, g))
+    return student_slots
 
 
 def _infeasibility_hints(
