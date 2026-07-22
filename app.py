@@ -6,16 +6,36 @@ Application Streamlit — Emploi du temps lycée
 """
 
 import copy
+import queue
+import threading
+import time
 from io import BytesIO
 
 import pandas as pd
 import streamlit as st
+from streamlit_sortables import sort_items
 
 import data as _data
 import solver as _solver
 import export as _export
 
 N_SLOTS = len(_data.SLOTS)
+
+DAY_ORDER = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi"]
+DAY_SLOTS: dict[str, list[int]] = {}
+for _c, (_, _day, _s, _e) in enumerate(_data.SLOTS):
+    DAY_SLOTS.setdefault(_day, []).append(_c)
+
+SPE_COLORS: dict[str, str] = {
+    "Maths": "#4a90e2",
+    "SES": "#27ae60",
+    "HLP": "#e67e22",
+    "LCE": "#8e44ad",
+    "NSI": "#16a085",
+    "HGGSP": "#c0392b",
+    "SPC": "#2980b9",
+    "SVT": "#1abc9c",
+}
 
 
 # Créneaux habituels pour les options connues (index 0-based interne)
@@ -93,6 +113,240 @@ def _option_panel(
         "En cas de conflit : déplacez les élèves concernés vers un autre groupe "
         "en étape 4, ou planifiez l'option sur un créneau de tronc commun."
     )
+
+def _slot_header(c: int) -> str:
+    return f"Cr{c+1} — {_data.SLOTS[c][1]} {_data.SLOTS[c][2]}"
+
+
+def _build_day_containers(
+    day: str,
+    groups: list[_solver.GroupResult],
+    slots_by_group: dict[str, list[int]],
+) -> list[dict]:
+    """Construit les containers sort_items pour un seul jour.
+    Chaque container = 1 créneau du jour. Groupes SPC/SVT exclus (lecture seule).
+    """
+    containers = []
+    for c in DAY_SLOTS.get(day, []):
+        items = []
+        for g in groups:
+            if g.specialite in _data.SPE_4_SLOTS:
+                continue
+            if c in slots_by_group.get(g.label, g.slots):
+                items.append(g.label)
+        containers.append({"header": _slot_header(c), "items": items})
+    return containers
+
+
+def _merge_day_containers(
+    day_edited: dict[str, list[dict]],
+    groups: list[_solver.GroupResult],
+) -> dict[str, list[int]]:
+    """Fusionne les résultats des 5 sort_items en un slots_by_group cohérent."""
+    result: dict[str, list[int]] = {}
+    for day, containers in day_edited.items():
+        for c_local, cont in enumerate(containers):
+            # Retrouver l'index global du slot depuis le header
+            day_slot_indices = DAY_SLOTS.get(day, [])
+            if c_local < len(day_slot_indices):
+                c_global = day_slot_indices[c_local]
+                for label in cont.get("items", []):
+                    result.setdefault(label, []).append(c_global)
+    # SPC/SVT : préserver leurs slots d'origine
+    for g in groups:
+        if g.specialite in _data.SPE_4_SLOTS:
+            result[g.label] = list(g.slots)
+    return result
+
+
+def _dnd_panel(
+    solver_result: _solver.SolverResult,
+    config: _solver.SolverConfig,
+    parse_result: _data.ParseResult,
+) -> None:
+    """Panneau interactif : déplacer les groupes entre créneaux via drag & drop.
+    Layout calendrier : métriques en haut, 5 colonnes de jours avec DnD vertical.
+    """
+    st.subheader("🎯 Optimiser manuellement — drag & drop")
+    st.caption(
+        "Glissez les cartes de groupes entre créneaux du même jour. "
+        "Pour déplacer un groupe vers un autre jour, utilisez l'éditeur ci-dessous. "
+        "Les métriques et violations se recalculent en temps réel. "
+        "Les groupes SPC/SVT ne sont pas éditables ici."
+    )
+
+    groups = sorted(solver_result.groups, key=lambda g: (g.specialite, g.groupe_id))
+
+    # État initial
+    if "dnd_slots_by_group" not in st.session_state or st.session_state.get("dnd_result_source") != id(solver_result):
+        st.session_state["dnd_slots_by_group"] = {g.label: list(g.slots) for g in groups}
+        st.session_state["dnd_result_source"] = id(solver_result)
+
+    slots_by_group = st.session_state["dnd_slots_by_group"]
+
+    # Calcul anticipé pour les métriques en haut
+    day_results: dict[str, list[dict]] = {}
+    for day in DAY_ORDER:
+        day_results[day] = _build_day_containers(day, groups, slots_by_group)
+    new_slots_by_group = _merge_day_containers(day_results, groups)
+
+    virtual = _solver.rebuild_from_slot_assignment(
+        solver_result, new_slots_by_group, config, parse_result
+    )
+    violations = _solver.check_hard_constraints(virtual.groups, config, parse_result)
+
+    # ── Métriques + violations (pleine largeur, en haut) ──
+    stats = virtual.stats
+    orig_stats = solver_result.stats
+    n_conf = stats.get("n_conflicts", 0)
+    n_perm = stats.get("n_permanences_slots", 0)
+    orig_conf = orig_stats.get("n_conflicts", 0)
+    orig_perm = orig_stats.get("n_permanences_slots", 0)
+
+    mc1, mc2, mc3 = st.columns(3)
+    mc1.metric(
+        "Conflits élèves",
+        n_conf,
+        delta=n_conf - orig_conf if n_conf != orig_conf else None,
+        delta_color="inverse",
+    )
+    mc2.metric(
+        "Permanences (créneaux)",
+        n_perm,
+        delta=n_perm - orig_perm if n_perm != orig_perm else None,
+        delta_color="inverse",
+    )
+    mc3.metric("Violations contraintes dures", len(violations))
+
+    if not violations:
+        st.success("✅ Toutes les contraintes dures sont respectées.")
+    else:
+        grouped_v: dict[str, list[str]] = {}
+        for v in violations:
+            grouped_v.setdefault(v.code, []).append(v.message)
+        for code, msgs in grouped_v.items():
+            with st.expander(f"❌ {code} ({len(msgs)})", expanded=True):
+                for m in msgs:
+                    st.markdown(f"- {m}")
+
+    st.divider()
+
+    # ── Calendrier DnD 5 colonnes ──
+    custom_style = """
+    .sortable-container {
+        border: 1px solid #ddd;
+        border-radius: 8px;
+        padding: 6px;
+        margin: 3px 0;
+        min-height: 60px;
+        background: #fafafa;
+    }
+    .sortable-container-header {
+        font-weight: 600;
+        font-size: 0.78em;
+        margin-bottom: 4px;
+        color: #555;
+    }
+    .sortable-item {
+        background: #4a90e2;
+        color: white;
+        padding: 3px 6px;
+        margin: 2px 0;
+        border-radius: 4px;
+        cursor: grab;
+        font-size: 0.82em;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+    """
+
+    day_cols = st.columns(5)
+    updated_day_results: dict[str, list[dict]] = {}
+    for day, col in zip(DAY_ORDER, day_cols):
+        with col:
+            st.markdown(f"**{day}**")
+            containers = _build_day_containers(day, groups, slots_by_group)
+            edited = sort_items(
+                containers,
+                multi_containers=True,
+                direction="vertical",
+                custom_style=custom_style,
+                key=f"dnd_{day}",
+            )
+            updated_day_results[day] = edited
+
+    new_slots_by_group = _merge_day_containers(updated_day_results, groups)
+    st.session_state["dnd_slots_by_group"] = new_slots_by_group
+
+    # ── Groupes SPC/SVT en lecture seule ──
+    spc_svt = [g for g in groups if g.specialite in _data.SPE_4_SLOTS]
+    if spc_svt:
+        with st.expander("🔬 Groupes SPC/SVT (lecture seule)", expanded=False):
+            rows = []
+            for g in spc_svt:
+                cours_lbl = ", ".join(f"Cr{c+1}" for c in g.cours_slots)
+                tp_lbl = " / ".join(
+                    f"A→Cr{sa+1} B→Cr{sb+1}" for sa, sb in g.tp_assignments
+                )
+                rows.append({
+                    "Groupe": g.label,
+                    "Cours (groupe entier)": cours_lbl,
+                    "TP (A/B)": tp_lbl,
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    # ── Éditeur cross-day ──
+    non_spc_groups = [g for g in groups if g.specialite not in _data.SPE_4_SLOTS]
+    if non_spc_groups:
+        with st.expander("↔️ Déplacer un groupe vers un autre jour", expanded=False):
+            all_labels = [g.label for g in non_spc_groups]
+            selected_label = st.selectbox("Groupe à déplacer", all_labels, key="xday_group")
+            if selected_label:
+                current_slots = new_slots_by_group.get(selected_label, [])
+                current_slot_names = [_slot_header(c) for c in current_slots]
+                st.caption(f"Créneaux actuels : {', '.join(current_slot_names) or '—'}")
+                all_slot_options = [_slot_header(c) for c in range(N_SLOTS)]
+                new_slot_names = st.multiselect(
+                    "Nouveaux créneaux",
+                    options=all_slot_options,
+                    default=current_slot_names,
+                    key="xday_slots",
+                )
+                if st.button("Appliquer", key="xday_apply"):
+                    new_indices = [i for i, h in enumerate(all_slot_options) if h in new_slot_names]
+                    new_sbg = dict(new_slots_by_group)
+                    new_sbg[selected_label] = new_indices
+                    st.session_state["dnd_slots_by_group"] = new_sbg
+                    for day in DAY_ORDER:
+                        st.session_state.pop(f"dnd_{day}", None)
+                    st.rerun()
+
+    st.divider()
+
+    # ── Actions ──
+    col_r, col_a = st.columns(2)
+    with col_r:
+        if st.button("🔄 Réinitialiser", use_container_width=True):
+            st.session_state["dnd_slots_by_group"] = {g.label: list(g.slots) for g in solver_result.groups}
+            for day in DAY_ORDER:
+                st.session_state.pop(f"dnd_{day}", None)
+            st.rerun()
+    with col_a:
+        adopt_disabled = len(violations) > 0
+        if st.button(
+            "✅ Adopter cette solution",
+            use_container_width=True,
+            type="primary",
+            disabled=adopt_disabled,
+            help="Impossible tant qu'il reste des violations." if adopt_disabled else None,
+        ):
+            st.session_state["solver_result"] = virtual
+            st.session_state["manual_groups"] = None
+            st.session_state["dnd_result_source"] = id(virtual)
+            st.success("Nouvelle solution adoptée. Elle sera utilisée à l'export.")
+            st.rerun()
+
 
 st.set_page_config(
     page_title="Emploi du temps lycée",
@@ -342,26 +596,76 @@ def step_config() -> None:
 
     timeout = st.slider(
         "Timeout solveur (secondes)",
-        10, 900, existing_config.timeout_seconds, step=30,
+        10, 3600, min(existing_config.timeout_seconds, 3600), step=30,
         help=(
             "Durée MAXIMALE allouée au solveur. Il s'arrête AUTOMATIQUEMENT plus tôt "
             "s'il prouve avoir exploré toutes les possibilités et trouvé l'optimum "
             "(statut OPTIMAL). Sinon, à l'expiration du timeout, il retourne la meilleure "
             "solution trouvée jusque-là (statut FEASIBLE — potentiellement améliorable "
-            "avec un timeout plus long). Max 900 s = 15 min."
+            "avec un timeout plus long). Max 3600 s = 1 h. "
+            "⚠️ Sur Streamlit Community Cloud, l'onglet peut se déconnecter au-delà de "
+            "~10 min : préférer ≤ 900 s en ligne, plus long en local."
         ),
     )
 
-    deterministic_mode = st.toggle(
-        "Mode déterministe",
-        value=getattr(existing_config, "deterministic_mode", False),
-        help=(
-            "Désactivé (recommandé) : 4 threads en parallèle — trouve une solution ~4× plus vite. "
-            "Les créneaux peuvent légèrement varier d'un run à l'autre.\n"
-            "Activé : 1 thread — résultat identique à chaque run, mais plus lent. "
-            "À utiliser uniquement si vous avez besoin de reproductibilité exacte."
-        ),
-    )
+    col_det, col_wk = st.columns([2, 1])
+    with col_det:
+        deterministic_mode = st.toggle(
+            "Mode déterministe",
+            value=getattr(existing_config, "deterministic_mode", False),
+            help=(
+                "Désactivé (recommandé) : plusieurs threads en parallèle — solution "
+                "trouvée bien plus vite. Les créneaux peuvent légèrement varier d'un "
+                "run à l'autre.\n"
+                "Activé : 1 thread — résultat identique à chaque run, mais plus lent. "
+                "À utiliser uniquement si vous avez besoin de reproductibilité exacte."
+            ),
+        )
+    with col_wk:
+        import os as _os
+        cpu_max = max(1, (_os.cpu_count() or 8))
+        num_workers = st.number_input(
+            "Nb workers (CPU)",
+            min_value=1,
+            max_value=max(cpu_max, 16),
+            value=int(getattr(existing_config, "num_workers", 8)),
+            step=1,
+            disabled=deterministic_mode,
+            help=(
+                "CP-SAT lance N stratégies de recherche en parallèle sur N cœurs. "
+                "Ignoré en mode déterministe (forcé à 1)."
+            ),
+        )
+
+    with st.expander("⚙️ Paramètres avancés solveur", expanded=False):
+        st.caption(
+            "CP-SAT est un solveur CPU multi-thread — le GPU n'est pas supporté. "
+            "Avec 8+ workers, le parallélisme est déjà maximal. "
+            "Ces options ajustent la stratégie de recherche interne."
+        )
+        col_adv1, col_adv2 = st.columns(2)
+        with col_adv1:
+            interleave_search = st.toggle(
+                "Interleave search",
+                value=getattr(existing_config, "interleave_search", False),
+                disabled=deterministic_mode,
+                help=(
+                    "Interleave agressif des stratégies de recherche entre workers. "
+                    "Peut accélérer la convergence sur des instances difficiles. "
+                    "Ignoré en mode déterministe."
+                ),
+            )
+        with col_adv2:
+            linearization_level = st.select_slider(
+                "Linearisation LP",
+                options=[0, 1, 2],
+                value=getattr(existing_config, "linearization_level", 1),
+                help=(
+                    "0 = LP désactivée (plus rapide par itération, moins de pruning). "
+                    "1 = défaut CP-SAT. "
+                    "2 = LP complète (moins de branches mais plus coûteux par nœud)."
+                ),
+            )
 
     st.divider()
     if st.button("Suivant : Résoudre →", type="primary"):
@@ -375,6 +679,9 @@ def step_config() -> None:
             timeout_seconds=timeout,
             niveau=result.niveau,
             deterministic_mode=deterministic_mode,
+            num_workers=int(num_workers),
+            interleave_search=interleave_search,
+            linearization_level=int(linearization_level),
         )
         st.session_state["config"] = new_config
         st.session_state["solver_result"] = None  # reset
@@ -390,6 +697,40 @@ def step_config() -> None:
 # Étape 3 — Résolution
 # ---------------------------------------------------------------------------
 
+def _clear_solve_thread_state() -> None:
+    for key in ("_solve_queue", "_solve_thread", "_solve_start", "_solving"):
+        st.session_state.pop(key, None)
+
+
+def _start_solve(
+    parse_result: _data.ParseResult,
+    config: _solver.SolverConfig,
+    initial_solution: "_solver.SolverResult | None" = None,
+) -> None:
+    q: queue.Queue = queue.Queue()
+    st.session_state["_solve_queue"] = q
+    st.session_state["_solve_start"] = time.monotonic()
+    st.session_state["_solving"] = True
+
+    def _worker() -> None:
+        try:
+            res = _solver.solve(parse_result, config, initial_solution=initial_solution)
+            q.put(("ok", res))
+        except Exception as exc:  # noqa: BLE001
+            q.put(("err", exc))
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    st.session_state["_solve_thread"] = t
+
+
+def _render_solve_progress(timeout_seconds: int, num_workers: int) -> None:
+    elapsed = time.monotonic() - st.session_state.get("_solve_start", time.monotonic())
+    pct = min(elapsed / max(timeout_seconds, 1), 0.99)
+    with st.status("Résolution en cours...", expanded=True, state="running"):
+        st.progress(pct, text=f"⏱️ {elapsed:.0f}s écoulées / {timeout_seconds}s — CP-SAT explore ({num_workers} workers)...")
+
+
 def step_solve() -> None:
     st.title("⚡ Résolution")
     result = st.session_state["parse_result"]
@@ -401,11 +742,30 @@ def step_solve() -> None:
 
     solver_result = st.session_state.get("solver_result")
 
-    if solver_result is None:
-        with st.spinner(f"Résolution en cours (timeout : {config.timeout_seconds}s)..."):
-            solver_result = _solver.solve(result, config)
-            st.session_state["solver_result"] = solver_result
+    # Récupérer résultat si thread terminé
+    _q = st.session_state.get("_solve_queue")
+    if _q is not None and not _q.empty():
+        tag, payload = _q.get_nowait()
+        _clear_solve_thread_state()
+        if tag == "ok":
+            st.session_state["solver_result"] = payload
             st.session_state["manual_groups"] = None
+        else:
+            st.error(f"Erreur solveur : {payload}")
+        st.rerun()
+        return
+
+    if solver_result is None and not st.session_state.get("_solving"):
+        warm_start = st.session_state.pop("_warm_start_from", None)
+        _start_solve(result, config, initial_solution=warm_start)
+        st.rerun()
+        return
+
+    if st.session_state.get("_solving"):
+        _render_solve_progress(config.timeout_seconds, config.num_workers)
+        time.sleep(0.5)
+        st.rerun()
+        return
 
     # Statut
     status = solver_result.status
@@ -421,6 +781,18 @@ def step_solve() -> None:
             "le solveur n'a pas pu prouver qu'elle est optimale. "
             "Augmenter le timeout en étape 2 pourrait donner une meilleure solution."
         )
+        col_warm, col_info = st.columns([1, 2])
+        with col_warm:
+            if st.button("🔁 Améliorer (warm start)", key="warm_start_btn"):
+                st.session_state["_warm_start_from"] = solver_result
+                st.session_state["solver_result"] = None
+                st.rerun()
+        with col_info:
+            st.caption(
+                "Relance le solveur en repartant de cette solution feasible. "
+                "Il peut trouver une meilleure solution plus rapidement en évitant "
+                "de reconstruire une première solution de zéro."
+            )
     elif status == "INFEASIBLE":
         st.error("❌ Aucune solution possible (INFEASIBLE).")
         if solver_result.infeasibility_hints:
@@ -512,6 +884,7 @@ def step_solve() -> None:
             st.rerun()
     with col_b:
         if st.button("🔄 Relancer la résolution"):
+            _clear_solve_thread_state()
             st.session_state["solver_result"] = None
             st.rerun()
     with col_c:
@@ -533,6 +906,10 @@ def step_adjustments() -> None:
     if solver_result is None or not solver_result.groups:
         st.error("Retournez à l'étape 3.")
         return
+
+    _dnd_panel(solver_result, config, parse_result)
+    solver_result = st.session_state["solver_result"]
+    st.divider()
 
     # Initialise l'état des groupes manuels si besoin
     if st.session_state["manual_groups"] is None:

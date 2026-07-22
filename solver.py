@@ -59,7 +59,23 @@ class SolverConfig:
 
     timeout_seconds: int = 300
     niveau: str = "Terminale"
-    deterministic_mode: bool = False  # True = 1 worker (reproductible), False = 4 workers (rapide)
+    deterministic_mode: bool = False  # True = 1 worker (reproductible), False = num_workers (rapide)
+    num_workers: int = 8
+    interleave_search: bool = False
+    linearization_level: int = 1  # 0=désactivé, 1=défaut CP-SAT, 2=LP complète
+
+
+@dataclass
+class Violation:
+    """Violation d'une contrainte dure détectée après édition manuelle."""
+    code: str        # ex. "HLP_MISSING_DAY", "SAME_DAY", "MATHS_COMMON", "NB_SLOTS"
+    spe: str
+    groupe_id: int   # -1 si global
+    message: str
+
+    @property
+    def group_label(self) -> str:
+        return f"{self.spe} {self.groupe_id + 1}" if self.groupe_id >= 0 else self.spe
 
 
 @dataclass
@@ -133,7 +149,108 @@ def build_default_config(parse_result: ParseResult) -> SolverConfig:
     )
 
 
-def solve(parse_result: ParseResult, config: SolverConfig) -> SolverResult:
+def _hints_compatible(
+    initial: "SolverResult",
+    config: SolverConfig,
+    specialites: list[str],
+) -> bool:
+    """Vérifie que la solution initiale est compatible avec la config courante."""
+    if not initial.groups:
+        return False
+    prev_spes = {g.specialite for g in initial.groups}
+    if prev_spes != set(specialites):
+        return False
+    for spe in specialites:
+        prev_g = len([g for g in initial.groups if g.specialite == spe])
+        if prev_g != config.nb_groups.get(spe, 1):
+            return False
+    return True
+
+
+def _apply_hints(
+    model: cp_model.CpModel,
+    initial: "SolverResult",
+    slot_var: dict,
+    groupe_var: dict,
+    in_group: dict,
+    cours_var: dict,
+    tp_day: dict,
+    tp_swap: dict,
+    sub_var: dict,
+    spe_to_students: dict,
+) -> None:
+    """Ajoute des hints CP-SAT depuis une solution existante pour warm-start."""
+    # Lookup: (nom, prenom, spe) → groupe_id
+    student_group: dict[tuple[str, str, str], int] = {}
+    for g in initial.groups:
+        for st in g.students:
+            student_group[(st.nom, st.prenom, g.specialite)] = g.groupe_id
+
+    # Lookup: (spe, groupe_id) → GroupResult
+    group_by_key: dict[tuple[str, int], "GroupResult"] = {
+        (g.specialite, g.groupe_id): g for g in initial.groups
+    }
+
+    for key, var in slot_var.items():
+        spe, g_id, c = key
+        prev = group_by_key.get((spe, g_id))
+        if prev is not None:
+            model.add_hint(var, 1 if c in prev.slots else 0)
+
+    for (idx, spe), var in groupe_var.items():
+        st_obj = next((s for (i, s) in spe_to_students.get(spe, []) if i == idx), None)
+        if st_obj is not None:
+            hint_g = student_group.get((st_obj.nom, st_obj.prenom, spe))
+            if hint_g is not None:
+                model.add_hint(var, hint_g)
+
+    for (idx, spe, g_id), var in in_group.items():
+        st_obj = next((s for (i, s) in spe_to_students.get(spe, []) if i == idx), None)
+        if st_obj is not None:
+            hint_g = student_group.get((st_obj.nom, st_obj.prenom, spe))
+            model.add_hint(var, 1 if hint_g == g_id else 0)
+
+    for key, var in cours_var.items():
+        spe, g_id, c = key
+        prev = group_by_key.get((spe, g_id))
+        if prev is not None:
+            model.add_hint(var, 1 if c in prev.cours_slots else 0)
+
+    for key, var in tp_day.items():
+        spe, g_id, pi = key
+        prev = group_by_key.get((spe, g_id))
+        if prev is not None:
+            c_a, c_b = VALID_TP_PAIRS[pi]
+            model.add_hint(var, 1 if (c_a, c_b) in prev.tp_pairs else 0)
+
+    for key, var in tp_swap.items():
+        spe, g_id, pi = key
+        prev = group_by_key.get((spe, g_id))
+        if prev is not None:
+            c_a, c_b = VALID_TP_PAIRS[pi]
+            if (c_a, c_b) in prev.tp_pairs:
+                assign_idx = prev.tp_pairs.index((c_a, c_b))
+                slot_a, _ = prev.tp_assignments[assign_idx]
+                model.add_hint(var, 1 if slot_a == c_b else 0)
+            else:
+                model.add_hint(var, 0)
+
+    for key, var in sub_var.items():
+        idx, spe = key
+        student_objs = spe_to_students.get(spe, [])
+        # sub_var est indexé par idx de spe_to_students, pas l'idx global
+        for i, (global_idx, st) in enumerate(student_objs):
+            if global_idx == idx:
+                prev = next((g for g in initial.groups
+                             if g.specialite == spe and st in g.students), None)
+                if prev and prev.subgroups:
+                    is_b = any(s.nom == st.nom and s.prenom == st.prenom
+                               for s in prev.subgroups.get("B", []))
+                    model.add_hint(var, 1 if is_b else 0)
+                break
+
+
+def solve(parse_result: ParseResult, config: SolverConfig, initial_solution: "SolverResult | None" = None) -> SolverResult:
     students = parse_result.students
     specialites = parse_result.all_specialites
     niveau = config.niveau
@@ -560,6 +677,16 @@ def solve(parse_result: ParseResult, config: SolverConfig) -> SolverResult:
     if obj_terms:
         model.minimize(sum(obj_terms))
 
+    # Warm-start : hints depuis une solution précédente
+    if initial_solution is not None and initial_solution.status in ("OPTIMAL", "FEASIBLE"):
+        if _hints_compatible(initial_solution, config, specialites):
+            _apply_hints(
+                model, initial_solution,
+                slot_var, groupe_var, in_group,
+                cours_var, tp_day, tp_swap, sub_var,
+                spe_to_students,
+            )
+
     # -----------------------------------------------------------------------
     # Résolution
     # -----------------------------------------------------------------------
@@ -570,7 +697,9 @@ def solve(parse_result: ParseResult, config: SolverConfig) -> SolverResult:
         solver.parameters.num_workers = 1
         solver.parameters.random_seed = 42
     else:
-        solver.parameters.num_workers = 4
+        solver.parameters.num_workers = max(1, int(config.num_workers))
+        solver.parameters.interleave_search = config.interleave_search
+        solver.parameters.linearization_level = config.linearization_level
 
     status_code = solver.solve(model)
     status_map = {
@@ -721,6 +850,203 @@ def _collect_student_slots(groups: list[GroupResult]) -> dict[str, set[int]]:
             key = f"{st.nom} {st.prenom}"
             student_slots.setdefault(key, set()).update(student_visible_slots(st, g))
     return student_slots
+
+
+def check_hard_constraints(
+    groups: list[GroupResult],
+    config: SolverConfig,
+    parse_result: ParseResult | None = None,
+) -> list[Violation]:
+    """Vérifie les contraintes dures d'une solution (potentiellement éditée manuellement).
+
+    Utilisé par la vue DnD pour signaler en temps réel les violations introduites
+    par un déplacement de groupe. Ne recompute PAS l'affectation des élèves — attend
+    des GroupResult déjà peuplés (typiquement issus du solveur, avec slots modifiés).
+    """
+    violations: list[Violation] = []
+    niveau = config.niveau
+
+    def nb_slots_required(spe: str) -> int:
+        if niveau == "Terminale":
+            return 4 if spe in SPE_4_SLOTS else 3
+        return 2
+
+    for g in groups:
+        n_req = nb_slots_required(g.specialite)
+        slots = list(g.slots)
+
+        # 1. Nombre de créneaux
+        if len(slots) != n_req:
+            violations.append(Violation(
+                code="NB_SLOTS",
+                spe=g.specialite,
+                groupe_id=g.groupe_id,
+                message=f"{g.label} : {len(slots)} créneau(x) affecté(s), {n_req} requis.",
+            ))
+
+        # 2. Taille max ≤ 38
+        if g.effectif > 38:
+            violations.append(Violation(
+                code="MAX_SIZE",
+                spe=g.specialite,
+                groupe_id=g.groupe_id,
+                message=f"{g.label} : {g.effectif} élèves (> 38).",
+            ))
+
+        # 3. Disponibilité par spé
+        avail = config.slot_availability.get(g.specialite, [True] * N_SLOTS)
+        for c in slots:
+            if 0 <= c < N_SLOTS and not avail[c]:
+                violations.append(Violation(
+                    code="SLOT_UNAVAILABLE",
+                    spe=g.specialite,
+                    groupe_id=g.groupe_id,
+                    message=(
+                        f"{g.label} : créneau Cr{c+1} ({SLOTS[c][1]} {SLOTS[c][2]}) "
+                        f"marqué comme indisponible."
+                    ),
+                ))
+
+        # 4. Deux créneaux même jour (non-SPC/SVT : sur `slots` ; SPC/SVT : sur `cours_slots`)
+        if g.specialite in SPE_4_SLOTS:
+            cours = set(g.cours_slots)
+            for c_a, c_b in SAME_DAY_PAIRS:
+                if c_a in cours and c_b in cours:
+                    violations.append(Violation(
+                        code="SAME_DAY",
+                        spe=g.specialite,
+                        groupe_id=g.groupe_id,
+                        message=(
+                            f"{g.label} : deux cours le même jour "
+                            f"(Cr{c_a+1} & Cr{c_b+1})."
+                        ),
+                    ))
+            # Paires TP valides
+            valid_tp = {frozenset(p) for p in VALID_TP_PAIRS}
+            for pair in g.tp_pairs:
+                if frozenset(pair) not in valid_tp:
+                    violations.append(Violation(
+                        code="INVALID_TP_PAIR",
+                        spe=g.specialite,
+                        groupe_id=g.groupe_id,
+                        message=f"{g.label} : paire TP {pair} non valide.",
+                    ))
+        else:
+            slot_set = set(slots)
+            for c_a, c_b in SAME_DAY_PAIRS:
+                if c_a in slot_set and c_b in slot_set:
+                    violations.append(Violation(
+                        code="SAME_DAY",
+                        spe=g.specialite,
+                        groupe_id=g.groupe_id,
+                        message=(
+                            f"{g.label} : deux créneaux le même jour "
+                            f"(Cr{c_a+1} & Cr{c_b+1})."
+                        ),
+                    ))
+
+    # 5. HLP : 1 Lundi + 1 Jeudi + 1 Autre
+    if config.constraint_hlp_philo_days:
+        for g in groups:
+            if g.specialite != "HLP":
+                continue
+            slot_set = set(g.slots)
+            n_lundi = len(slot_set & LUNDI_SLOTS)
+            n_jeudi = len(slot_set & JEUDI_SLOTS)
+            n_autre = len(slot_set & AUTRE_SLOTS)
+            if n_lundi != 1:
+                violations.append(Violation(
+                    code="HLP_LUNDI",
+                    spe="HLP",
+                    groupe_id=g.groupe_id,
+                    message=f"{g.label} : {n_lundi} créneau(x) Lundi (attendu 1).",
+                ))
+            if n_jeudi != 1:
+                violations.append(Violation(
+                    code="HLP_JEUDI",
+                    spe="HLP",
+                    groupe_id=g.groupe_id,
+                    message=f"{g.label} : {n_jeudi} créneau(x) Jeudi (attendu 1).",
+                ))
+            if n_autre != 1:
+                violations.append(Violation(
+                    code="HLP_AUTRE",
+                    spe="HLP",
+                    groupe_id=g.groupe_id,
+                    message=f"{g.label} : {n_autre} créneau(x) hors Lundi/Jeudi (attendu 1).",
+                ))
+
+    # 6. Maths créneau commun
+    if config.constraint_maths_common_slot:
+        maths_groups = [g for g in groups if g.specialite == "Maths"]
+        if len(maths_groups) > 1:
+            common = set(maths_groups[0].slots)
+            for mg in maths_groups[1:]:
+                common &= set(mg.slots)
+            if config.maths_common_slot_idx not in common:
+                violations.append(Violation(
+                    code="MATHS_COMMON",
+                    spe="Maths",
+                    groupe_id=-1,
+                    message=(
+                        f"Maths : le créneau commun Cr{config.maths_common_slot_idx+1} "
+                        f"n'est pas partagé par tous les groupes."
+                    ),
+                ))
+
+    return violations
+
+
+def rebuild_from_slot_assignment(
+    original: SolverResult,
+    new_slots_by_group: dict[str, list[int]],
+    config: SolverConfig,
+    parse_result: ParseResult | None = None,
+) -> SolverResult:
+    """Reconstruit un SolverResult après édition manuelle des slots via DnD.
+
+    `new_slots_by_group` : mapping {group.label: [slot_indices]}. Les groupes non
+    listés conservent leurs slots d'origine.
+    Pour SPC/SVT : les slots ne sont PAS éditables via DnD (v1) — on préserve
+    cours_slots/tp_pairs/tp_assignments/subgroups tels quels.
+    """
+    import copy as _copy
+
+    new_groups: list[GroupResult] = []
+    for g in original.groups:
+        if g.specialite in SPE_4_SLOTS:
+            new_groups.append(_copy.deepcopy(g))
+            continue
+        new_slots = new_slots_by_group.get(g.label, list(g.slots))
+        ng = GroupResult(
+            specialite=g.specialite,
+            groupe_id=g.groupe_id,
+            students=list(g.students),
+            slots=sorted(new_slots),
+            subgroups=g.subgroups,
+            tp_pairs=list(g.tp_pairs),
+            tp_assignments=list(g.tp_assignments),
+            cours_slots=list(g.cours_slots),
+        )
+        new_groups.append(ng)
+
+    n_conflicts = _count_conflicts(new_groups)
+    n_perm_slots = _count_permanences_slots(new_groups)
+    n_perm_students = _count_permanences(new_groups)
+    new_stats = dict(original.stats)
+    new_stats.update({
+        "n_conflicts": n_conflicts,
+        "n_permanences": n_perm_students,
+        "n_permanences_students": n_perm_students,
+        "n_permanences_slots": n_perm_slots,
+    })
+
+    return SolverResult(
+        status="MANUAL",
+        groups=new_groups,
+        stats=new_stats,
+        infeasibility_hints=[],
+    )
 
 
 def _infeasibility_hints(

@@ -7,10 +7,14 @@ from data import Student, ParseResult, SLOTS, SAME_DAY_PAIRS, VALID_TP_PAIRS, SP
 from solver import (
     SolverConfig,
     GroupResult,
+    SolverResult,
+    Violation,
     solve,
     build_default_config,
     default_slot_availability,
     split_lab_groups,
+    check_hard_constraints,
+    rebuild_from_slot_assignment,
     _count_conflicts,
     SLOT_MATCO,
     SLOT_MATEX,
@@ -348,6 +352,144 @@ def test_permanences_slots_metric():
     assert result.stats["n_permanences_slots"] >= result.stats["n_permanences_students"]
 
 
+# ---------------------------------------------------------------------------
+# Tests check_hard_constraints + rebuild_from_slot_assignment
+# ---------------------------------------------------------------------------
+
+def _default_config_all_avail(niveau: str = "Terminale") -> SolverConfig:
+    return SolverConfig(
+        nb_groups={},
+        slot_availability={},
+        constraint_lce_no_early=False,
+        constraint_hlp_philo_days=True,
+        constraint_maths_common_slot=True,
+        maths_common_slot_idx=SLOT_MATCO,
+        niveau=niveau,
+    )
+
+
+def _hlp_valid_slots() -> list[int]:
+    # 1 Lundi (Cr0), 1 Jeudi (Cr5), 1 Autre (Cr2)
+    return [0, 2, 5]
+
+
+def test_check_valid_no_violations():
+    g = GroupResult(specialite="SES", groupe_id=0, students=[], slots=[2, 5, 7])
+    config = _default_config_all_avail()
+    config.constraint_maths_common_slot = False
+    violations = check_hard_constraints([g], config)
+    assert violations == []
+
+
+def test_check_nb_slots_mismatch():
+    g = GroupResult(specialite="SES", groupe_id=0, students=[], slots=[2, 5])  # 2 au lieu de 3
+    config = _default_config_all_avail()
+    config.constraint_maths_common_slot = False
+    violations = check_hard_constraints([g], config)
+    codes = [v.code for v in violations]
+    assert "NB_SLOTS" in codes
+
+
+def test_check_same_day():
+    g = GroupResult(specialite="SES", groupe_id=0, students=[], slots=[2, 3, 5])  # Mardi 8h + Mardi 10h
+    config = _default_config_all_avail()
+    config.constraint_maths_common_slot = False
+    violations = check_hard_constraints([g], config)
+    codes = [v.code for v in violations]
+    assert "SAME_DAY" in codes
+
+
+def test_check_hlp_missing_lundi():
+    g = GroupResult(specialite="HLP", groupe_id=0, students=[], slots=[2, 5, 7])  # pas de Lundi
+    config = _default_config_all_avail()
+    config.constraint_maths_common_slot = False
+    violations = check_hard_constraints([g], config)
+    codes = [v.code for v in violations]
+    assert "HLP_LUNDI" in codes
+
+
+def test_check_hlp_valid():
+    g = GroupResult(specialite="HLP", groupe_id=0, students=[], slots=_hlp_valid_slots())
+    config = _default_config_all_avail()
+    config.constraint_maths_common_slot = False
+    violations = check_hard_constraints([g], config)
+    assert [v for v in violations if v.code.startswith("HLP")] == []
+
+
+def test_check_maths_common_violated():
+    g1 = GroupResult(specialite="Maths", groupe_id=0, students=[], slots=[2, 5, 7])  # pas Cr4
+    g2 = GroupResult(specialite="Maths", groupe_id=1, students=[], slots=[2, 5, 8])
+    config = _default_config_all_avail()
+    config.maths_common_slot_idx = 4  # Cr4
+    violations = check_hard_constraints([g1, g2], config)
+    codes = [v.code for v in violations]
+    assert "MATHS_COMMON" in codes
+
+
+def test_check_maths_common_ok():
+    g1 = GroupResult(specialite="Maths", groupe_id=0, students=[], slots=[2, 4, 5])
+    g2 = GroupResult(specialite="Maths", groupe_id=1, students=[], slots=[0, 4, 7])
+    config = _default_config_all_avail()
+    config.maths_common_slot_idx = 4
+    violations = check_hard_constraints([g1, g2], config)
+    assert [v for v in violations if v.code == "MATHS_COMMON"] == []
+
+
+def test_check_slot_unavailable():
+    g = GroupResult(specialite="SES", groupe_id=0, students=[], slots=[2, 5, 7])
+    config = _default_config_all_avail()
+    config.constraint_maths_common_slot = False
+    config.slot_availability = {"SES": [True]*N_SLOTS}
+    config.slot_availability["SES"][2] = False  # Cr3 (index 2) indisponible
+    violations = check_hard_constraints([g], config)
+    codes = [v.code for v in violations]
+    assert "SLOT_UNAVAILABLE" in codes
+
+
+def test_rebuild_updates_slots_and_stats():
+    students = [_make_student(f"E{i}", ["SES", "HGGSP"]) for i in range(5)]
+    g_ses = GroupResult(specialite="SES", groupe_id=0, students=students, slots=[2, 5, 7])
+    g_hg = GroupResult(specialite="HGGSP", groupe_id=0, students=students, slots=[0, 3, 6])
+    original = SolverResult(
+        status="OPTIMAL",
+        groups=[g_ses, g_hg],
+        stats={"n_conflicts": 0, "n_permanences_slots": 0, "n_permanences_students": 0},
+        infeasibility_hints=[],
+    )
+    config = _default_config_all_avail()
+    # Déplace SES sur les mêmes créneaux que HGGSP → conflits
+    rebuilt = rebuild_from_slot_assignment(
+        original,
+        {"SES 1": [0, 3, 6]},
+        config,
+    )
+    assert rebuilt.status == "MANUAL"
+    ses_new = next(g for g in rebuilt.groups if g.specialite == "SES")
+    assert set(ses_new.slots) == {0, 3, 6}
+    # Conflit détecté sur 3 créneaux × 5 élèves
+    assert rebuilt.stats["n_conflicts"] > 0
+
+
+def test_rebuild_preserves_spc_svt_slots():
+    students = [_make_student(f"E{i}", ["SPC", "SVT"]) for i in range(4)]
+    g = GroupResult(
+        specialite="SPC", groupe_id=0, students=students,
+        slots=[0, 2, 3, 5],
+        cours_slots=[0, 5], tp_pairs=[(2, 3)], tp_assignments=[(2, 3)],
+        subgroups={"A": students[:2], "B": students[2:]},
+    )
+    original = SolverResult(
+        status="OPTIMAL", groups=[g],
+        stats={}, infeasibility_hints=[],
+    )
+    config = _default_config_all_avail()
+    # Même si on tente de bouger SPC, ses slots sont préservés
+    rebuilt = rebuild_from_slot_assignment(original, {"SPC 1": [7, 8]}, config)
+    spc_new = rebuilt.groups[0]
+    assert sorted(spc_new.slots) == [0, 2, 3, 5]
+    assert spc_new.tp_pairs == [(2, 3)]
+
+
 def test_determinism():
     """Deux runs en mode déterministe donnent exactement les mêmes slots."""
     from data import parse_xlsx
@@ -361,3 +503,60 @@ def test_determinism():
     slots1 = {g.label: sorted(g.slots) for g in r1.groups}
     slots2 = {g.label: sorted(g.slots) for g in r2.groups}
     assert slots1 == slots2, "Les deux runs donnent des slots différents (non-déterministe)"
+
+
+# ---------------------------------------------------------------------------
+# Test warm-start
+# ---------------------------------------------------------------------------
+
+def test_warm_start_no_worse_conflicts():
+    """Un run avec warm-start ne doit pas produire plus de conflits que le run initial."""
+    from data import parse_xlsx
+    pr = parse_xlsx(XLSX_PATH)
+    config = build_default_config(pr)
+    config.timeout_seconds = 15
+    r1 = solve(pr, config)
+    assert r1.status in ("OPTIMAL", "FEASIBLE")
+    r2 = solve(pr, config, initial_solution=r1)
+    assert r2.status in ("OPTIMAL", "FEASIBLE")
+    assert _count_conflicts(r2.groups) <= _count_conflicts(r1.groups)
+
+
+def test_warm_start_with_none_is_identical_signature():
+    """Passer initial_solution=None doit donner le même comportement qu'avant."""
+    students = [_make_student(f"E{i}", ["Maths", "SES"]) for i in range(6)]
+    pr = _make_parse_result(students)
+    config = SolverConfig(
+        nb_groups={"Maths": 1, "SES": 1},
+        slot_availability={
+            "Maths": [True, False, True, True, True, True, True, True, True, True],
+            "SES": [True, False, True, True, True, True, True, True, True, True],
+        },
+        constraint_maths_common_slot=False,
+        constraint_hlp_philo_days=False,
+        constraint_lce_no_early=False,
+        timeout_seconds=15,
+        niveau="Terminale",
+    )
+    result = solve(pr, config, initial_solution=None)
+    assert result.status in ("OPTIMAL", "FEASIBLE")
+    assert _count_conflicts(result.groups) == 0
+
+
+def test_solver_config_new_fields():
+    """SolverConfig accepte les nouveaux champs avec leurs valeurs par défaut."""
+    config = SolverConfig(nb_groups={}, slot_availability={})
+    assert config.interleave_search is False
+    assert config.linearization_level == 1
+
+
+def test_linearization_level_produces_valid_result():
+    """linearization_level=2 doit toujours produire une solution valide."""
+    from data import parse_xlsx
+    pr = parse_xlsx(XLSX_PATH)
+    config = build_default_config(pr)
+    config.timeout_seconds = 15
+    config.linearization_level = 2
+    result = solve(pr, config)
+    assert result.status in ("OPTIMAL", "FEASIBLE")
+    assert _count_conflicts(result.groups) == 0
